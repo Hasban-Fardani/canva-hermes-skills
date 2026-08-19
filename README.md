@@ -68,6 +68,22 @@ the Hermes environment. The installer copies only files referenced by each
 `SKILL.md`; the bundled scripts are invoked with Python and do not depend on an
 executable bit.
 
+### GitHub access and rate limits
+
+This public repository can be tapped anonymously. GitHub's anonymous API limit
+is 60 requests per hour per network identity, and Hermes reads multiple support
+files during inspection and installation. For servers and CI, use a
+least-privilege `GITHUB_TOKEN`, `GH_TOKEN`, or GitHub App with Contents read;
+authenticated API access provides up to 5,000 requests per hour and is more
+stable for repeated installs. Set credentials through environment injection or
+a secret manager. Never paste a token into a command, prompt, issue, log, or
+repository.
+
+Private repositories always require one of those authenticated read-only
+connections. If `inspect` or `install` retries or becomes slow, check Hermes
+logs for GitHub rate-limit responses and configure a read-only credential; do
+not modify the skill files to work around a rate limit.
+
 ## Canva OAuth setup
 
 1. Configure the Canva connector in Hermes using its OAuth flow and the least
