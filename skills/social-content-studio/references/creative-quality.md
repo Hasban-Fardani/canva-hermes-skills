@@ -46,6 +46,27 @@ match, layout/overflow checks, semantic object/count/relation checks, WCAG
 contrast and alt text, rights/provenance, recent-fingerprint similarity,
 independent critique, and a scoped approval-package checksum.
 
+Treat every visible word as a message unit, including a tiny eyebrow, footer,
+page count, arrow, annotation, or caption fragment. Before Canva mutation,
+record its distinct `information_job` or a justified functional role in the
+`message_units`/`text_elements` manifest. Source, legal, accessibility,
+navigation, action, label, branding, and annotation roles are valid only when
+their rationale and provenance explain what the reader can learn, verify, or
+do. A repeated theme header, decorative page count, standalone arrow, fake
+annotation, or filler caption with no such job is the explainable
+`REDUNDANT_DECORATIVE_MICROCOPY` finding. Remove it or give it a real job;
+do not use a generic “footer” or “label” tag to preserve empty space. Repeated
+CTAs and necessary metadata are false positives when their action or metadata
+role is recorded and supported by independently validated provenance. Mutable
+source-packet IDs are not approval evidence. Navigation/accessibility targets,
+`label_for`, and brand-asset references must resolve to real content or
+approved Brand Copy assets. An `action` role is reserved for an actual
+CTA/action field with non-trivial action copy, and generic “Overview”, “Guide”,
+or “Panduan” labels need role-specific evidence. An `information_job`
+by itself does not excuse a page count, arrow, or repeated theme header: use a
+justified functional role with a bound path and evidence when the element is
+genuinely needed.
+
 ## Information architecture
 
 For a carousel, use this default only when it fits the idea:

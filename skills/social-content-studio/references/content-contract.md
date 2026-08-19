@@ -42,6 +42,58 @@ premise and rationale, and carries exactly one distinctive move. Every
 decorative element needs a `semantic_role` and rationale. Essential copy,
 logos, icons, CTA, and layout remain editable and structured.
 
+### Visible microcopy and message-unit contract
+
+Small text is still content. A production or Canva-mutation record must carry a
+top-level `message_units` list (the `text_elements` alias is accepted), or an
+equivalent list on the owning slide/caption. Each visible item records:
+
+```json
+{
+  "path": "$.slides[1].headline",
+  "text": "Source: approved checklist",
+  "information_job": "Identifies the evidence behind the checklist",
+  "functional_role": "source",
+  "role_justification": "Lets the reader verify where this label came from",
+  "provenance": {"source_ids": ["source-checklist"]}
+}
+```
+
+`information_job` is the preferred field. A `functional_role` is an allowed
+exception only when it is one of `source`, `legal`, `accessibility`,
+`navigation`, `action`, `label`, `branding`, or `annotation`, and has a
+concrete `role_justification`. Source, legal, accessibility, navigation,
+label, branding, and annotation text also needs non-empty provenance that
+resolves to an approved source, claim, policy, or brand record. This keeps
+necessary metadata such as a source line, legal notice, accessible reading
+cue, page navigation, or CTA without making every footer or badge a free pass.
+The provenance must resolve in independently validated authority; mutable IDs
+listed only in the content record's `source_packet` do not authorize a
+functional exception.
+The `path` is a restricted JSONPath-like binding into the content record; it
+must resolve to an existing string and `text` must match that value exactly.
+`visible: false` cannot hide a canonical visible field. Declare only one of
+`message_units` or its `text_elements` alias at each scope, and do not bind the
+same resolved path through multiple scopes or aliases. Navigation and
+accessibility targets, `label_for`, and brand-asset references must resolve to
+content fields or approved Brand Copy assets; a self-attested target/asset ID
+does not count. An `action` role is valid only on a CTA/action field with
+non-trivial action copy; it cannot exempt a repeated header. Generic `label`
+text such as “Overview”, “Guide”, or “Panduan” needs role-specific evidence
+and cannot be legalized with a generic brand ID. Accepted units are included
+in approval and copy checksums; records without a manifest retain the legacy
+checksum shape during migration.
+
+The validator emits the explainable reason code
+`REDUNDANT_DECORATIVE_MICROCOPY` for unqualified repeated theme headers,
+decorative page counts, standalone arrows, fake annotations, and known filler
+captions. In production these are errors; in earlier drafts they are warnings
+to support migration. Repeated CTAs and source/legal/accessibility/navigation
+metadata remain valid when their job/role and provenance are recorded. Do not
+use a decorative role, a generic `label` tag, or a job such as “fill space” as
+an explanation. Visible text without a distinct job or justified role fails
+the Canva production gate.
+
 ### Canva production controls
 
 `production_controls` is a scoped snapshot of the approved local template

@@ -17,7 +17,11 @@ For every new message or visual language, the content contract must first pass
 the scoped source packet, three-to-five route-card, human route-selection, and
 art-direction gates in
 [`references/content-contract.md`](references/content-contract.md). A Canva
-mutation is not authorized by a prompt or by a folder search result.
+mutation is not authorized by a prompt or by a folder search result. Every
+visible text element in a mutation must also be represented in the content
+record's `message_units`/`text_elements` manifest with a distinct
+`information_job` or a provenance-backed functional role; decorative microcopy
+fails the validator before a remote write.
 
 Keep design, render, export, and manual handoff separate from optional social
 publishing. Canva-only work does not require a publishing login or temporary

@@ -83,11 +83,13 @@ ANTI_SLOP_REASON_CODES = {
     "route_not_selected",
     "independent_critique_missing",
     "approval_package_missing",
+    "REDUNDANT_DECORATIVE_MICROCOPY",
 }
 COPY_QUALITY_REASON_CODES = {
     "ABSTRACT_WITHOUT_SCENE", "NEGATION_INSIGHT_WITHOUT_EVIDENCE", "FAKE_INTIMACY_WITHOUT_PROVENANCE",
     "GENERIC_MOTIVATIONAL_CLOSURE", "DECORATIVE_SAVE_CTA", "PARAPHRASE_NO_PROGRESS",
     "INTERCHANGEABLE_BRAND_COPY", "UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM",
+    "REDUNDANT_DECORATIVE_MICROCOPY",
 }
 # Indonesian register findings are editorial warnings, not authorship labels or
 # EYD failures.  Keep the codes stable so a native/pairwise review can refer to
@@ -172,6 +174,58 @@ ID_REVIEW_METHODS = {
     "neutral_editorial_fallback",
     "neutral-editorial-fallback",
 }
+
+# Text that is visible in a Canva design is content, even when it is small.
+# These roles are intentionally narrow: a role is only an exception when it
+# also has a concrete justification and provenance.  This prevents a generic
+# "label" or "footer" tag from becoming a blanket bypass for filler copy.
+MICROCOPY_FUNCTIONAL_ROLES = {
+    "source",
+    "legal",
+    "accessibility",
+    "navigation",
+    "action",
+    "label",
+    "branding",
+    "annotation",
+}
+MICROCOPY_PROVENANCE_KEYS = (
+    "provenance",
+    "source_ids",
+    "source_id",
+    "proof_ids",
+    "claim_id",
+    "source_ref",
+    "legal_reference",
+    "brand_id",
+)
+MICROCOPY_PAGE_COUNT_RE = re.compile(
+    r"^(?:page|slide|halaman)\s*\d+(?:\s*(?:/|of|dari)\s*\d+)?$|^\d+\s*/\s*\d+$",
+    re.IGNORECASE,
+)
+MICROCOPY_ARROW_RE = re.compile(r"^[\s\-–—·•]*(?:[←↑→↓↔↕➜➝➞➟➤➔»«]|->|<-)+[\s\-–—·•]*$")
+MICROCOPY_FAKE_ANNOTATION_RE = re.compile(
+    r"^(?:note|catatan|tip|pro\s+tip|insight|ps|psst|fyi|quick\s+note)\s*(?:[:.!-]\s*.*)?$",
+    re.IGNORECASE,
+)
+MICROCOPY_FILLER_RE = re.compile(
+    r"^(?:(?:just\s+)?a\s+little\s+reminder|just\s+a\s+thought|let\s+that\s+sink\s+in|you(?:'|’)ve\s+got\s+this|"
+    r"good\s+things\s+take\s+time|keep\s+going|small\s+steps|sedikit\s+pengingat|"
+    r"catatan\s+kecil|tetap\s+semangat|semangat\s+(?:hari\s+ini|ya))\s*[.!…]*$",
+    re.IGNORECASE,
+)
+MICROCOPY_REDUNDANT_LABEL_RE = re.compile(
+    r"^(?:section|chapter|category|topic|overview|introduction|intro|guide|tips?|insight|"
+    r"the\s+basics|the\s+takeaway|in\s+focus|our\s+approach|next|more|about|"
+    r"bagian|bab|kategori|topik|ringkasan|pengantar|panduan|tips?|insight|"
+    r"bagian\s+\d+|part\s+\d+|step\s+\d+)\s*[.!…]*$",
+    re.IGNORECASE,
+)
+MICROCOPY_DECORATIVE_JOB_RE = re.compile(
+    r"\b(?:decorative|ornament(?:al)?|filler|fill\s+space|visual\s+interest|hiasan|ornamen|pengisi)\b",
+    re.IGNORECASE,
+)
+JSON_PATH_TOKEN_RE = re.compile(r"(?:\.([A-Za-z_][A-Za-z0-9_-]*)|\[(\d+)\])")
 ANTI_SLOP_REASON_CODE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,63}")
 ANTI_SLOP_SLOP_DIMENSIONS = (
     "generic_language",
@@ -1365,6 +1419,722 @@ def _tokens(value: str) -> set[str]:
     }
 
 
+def _message_unit_text(unit: dict[str, Any]) -> str:
+    """Return the visible text from a message-unit record."""
+
+    for key in ("text", "value", "content", "copy"):
+        value = unit.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _message_unit_path(unit: dict[str, Any], fallback: str) -> str:
+    for key in ("path", "field_path", "json_path", "location"):
+        value = unit.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    surface = unit.get("surface")
+    field = unit.get("field", unit.get("element"))
+    if isinstance(surface, str) and isinstance(field, str) and surface.strip() and field.strip():
+        prefix = surface.strip()
+        if not prefix.startswith("$"):
+            prefix = f"$.{prefix}"
+        return f"{prefix}.{field.strip()}"
+    return fallback
+
+
+def _resolve_json_path(value: Any, path: str) -> tuple[bool, Any]:
+    """Resolve the small JSONPath subset used for visible text bindings."""
+
+    if not isinstance(path, str) or not path.startswith("$"):
+        return False, None
+    current = value
+    position = 1
+    if path == "$":
+        return True, current
+    while position < len(path):
+        match = JSON_PATH_TOKEN_RE.match(path, position)
+        if match is None:
+            return False, None
+        key, index_text = match.groups()
+        if key is not None:
+            if not isinstance(current, dict) or key not in current:
+                return False, None
+            current = current[key]
+        else:
+            if not isinstance(current, list):
+                return False, None
+            index = int(index_text)
+            if index >= len(current):
+                return False, None
+            current = current[index]
+        position = match.end()
+    return True, current
+
+
+def _message_unit_alias_conflicts(spec: dict[str, Any]) -> list[str]:
+    conflicts: list[str] = []
+    scopes: list[tuple[str, dict[str, Any]]] = [("$", spec)]
+    slides = spec.get("slides")
+    if isinstance(slides, list):
+        scopes.extend((f"$.slides[{index}]", slide) for index, slide in enumerate(slides) if isinstance(slide, dict))
+    caption = spec.get("caption")
+    if isinstance(caption, dict):
+        scopes.append(("$.caption", caption))
+    for path, scope in scopes:
+        if "message_units" in scope and "text_elements" in scope:
+            conflicts.append(path)
+    return conflicts
+
+
+def _message_unit_information_job(unit: dict[str, Any]) -> str | None:
+    for key in ("information_job", "message_job", "job"):
+        value = unit.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _message_unit_role(unit: dict[str, Any]) -> str | None:
+    for key in ("functional_role", "role", "function"):
+        value = unit.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().casefold()
+    return None
+
+
+def _provenance_id_values(value: Any) -> tuple[list[str], bool]:
+    """Return provenance IDs and whether the supplied shape is well-formed."""
+
+    if isinstance(value, str):
+        return ([value], bool(value.strip()))
+    if isinstance(value, list):
+        if not value or any(not isinstance(item, str) or not item.strip() for item in value):
+            return ([], False)
+        return (value, True)
+    return ([], False)
+
+
+def _approved_provenance_ids(spec: dict[str, Any], authority: dict[str, Any] | None) -> set[str]:
+    """Return IDs from independently validated authority, never the mutable content packet."""
+
+    ids: set[str] = set()
+    if not isinstance(authority, dict):
+        return ids
+    profile = authority.get("profile")
+    if isinstance(profile, dict) and profile.get("status") in {"active", "approved"}:
+        brand_id = profile.get("brand_id")
+        if isinstance(brand_id, str) and brand_id.strip():
+            ids.add(brand_id)
+    documents = authority.get("documents") if isinstance(authority.get("documents"), dict) else {}
+    provenance = documents.get("provenance.json") if isinstance(documents.get("provenance.json"), dict) else {}
+    sources = provenance.get("sources", [])
+    if isinstance(sources, list):
+        for record in sources:
+            if not isinstance(record, dict):
+                continue
+            authorization = record.get("authorization")
+            status = authorization.get("status") if isinstance(authorization, dict) else record.get("status")
+            identifier = record.get("source_id")
+            if status in {"approved", "exact"} and isinstance(identifier, str) and identifier.strip():
+                ids.add(identifier)
+    for key, records in (("claim-registry.json", authority.get("claims")), ("template-registry.json", authority.get("templates"))):
+        if not isinstance(records, list):
+            document = documents.get(key) if isinstance(documents.get(key), dict) else {}
+            records = document.get("claims", document.get("templates", []))
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict) or record.get("status") != "approved":
+                continue
+            identifier = record.get("id", record.get("claim_id"))
+            if isinstance(identifier, str) and identifier.strip():
+                ids.add(identifier)
+    return ids
+
+
+def _approved_brand_asset_ids(authority: dict[str, Any] | None) -> set[str]:
+    """Return only asset IDs from an independently validated active brand bundle."""
+
+    if not isinstance(authority, dict):
+        return set()
+    profile = authority.get("profile")
+    if not isinstance(profile, dict) or profile.get("status") not in {"active", "approved"}:
+        return set()
+    identifiers: set[str] = set()
+    for key in ("distinctive_assets", "brand_assets", "visual_assets", "assets"):
+        records = profile.get(key, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            rights = record.get("rights")
+            rights_status = rights.get("status") if isinstance(rights, dict) else None
+            if record.get("status") != "approved" and record.get("evidence_status") not in {"exact", "observed"} and rights_status not in {"approved", "exact"}:
+                continue
+            for field in ("id", "asset_id", "brand_asset_id", "asset_ref"):
+                value = record.get(field)
+                if isinstance(value, str) and value.strip():
+                    identifiers.add(value)
+    return identifiers
+
+
+def _validate_message_unit_provenance(
+    unit: dict[str, Any],
+    path: str,
+    spec: dict[str, Any],
+    role: str | None,
+    report: Report,
+    authority: dict[str, Any] | None,
+) -> bool:
+    """Validate provenance shape and resolve IDs used by functional roles."""
+
+    id_fields = ("source_ids", "proof_ids", "source_id", "source_ref", "claim_id", "legal_reference", "brand_id")
+    ids: list[str] = []
+    valid = True
+    for key in id_fields:
+        if key not in unit:
+            continue
+        values, field_valid = _provenance_id_values(unit.get(key))
+        if not field_valid:
+            report.error("message_unit_provenance_type", f"{path}.{key}", "Provenance IDs must be non-empty strings or a non-empty list of non-empty strings.")
+            valid = False
+        ids.extend(values)
+
+    provenance = unit.get("provenance")
+    required_role = role in {"source", "legal", "accessibility", "navigation", "label", "branding", "annotation"}
+    if required_role and provenance is None and not ids:
+        report.error("message_unit_provenance_missing", f"{path}.provenance", "This functional role requires provenance or a top-level provenance ID field.")
+        valid = False
+    if provenance is not None:
+        if not isinstance(provenance, (dict, list)):
+            report.error("message_unit_provenance_type", f"{path}.provenance", "provenance must be an object or list; IDs inside it must be non-empty strings.")
+            valid = False
+        elif isinstance(provenance, list):
+            values, field_valid = _provenance_id_values(provenance)
+            if not field_valid:
+                report.error("message_unit_provenance_type", f"{path}.provenance", "A provenance list must contain non-empty string IDs.")
+                valid = False
+            ids.extend(values)
+        else:
+            recognized = False
+            for key in id_fields:
+                if key not in provenance:
+                    continue
+                recognized = True
+                values, field_valid = _provenance_id_values(provenance.get(key))
+                if not field_valid:
+                    report.error("message_unit_provenance_type", f"{path}.provenance.{key}", "Provenance IDs must be non-empty strings or a non-empty list of non-empty strings.")
+                    valid = False
+                ids.extend(values)
+            for key in ("id", "ref"):
+                if key in provenance:
+                    recognized = True
+                    value = provenance.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        report.error("message_unit_provenance_type", f"{path}.provenance.{key}", "Provenance references must be non-empty strings.")
+                        valid = False
+                    else:
+                        ids.append(value)
+            if not recognized:
+                report.error("message_unit_provenance_type", f"{path}.provenance", "provenance must contain a non-empty ID or reference.")
+                valid = False
+
+    if role in {"source", "label", "branding", "annotation"} and not ids:
+        report.error("message_unit_provenance_id_missing", f"{path}.provenance", "This functional role requires at least one provenance ID.")
+        valid = False
+    approved_ids = _approved_provenance_ids(spec, authority)
+    unresolved = sorted(set(ids) - approved_ids)
+    if required_role and unresolved:
+        report.error(
+            "message_unit_provenance_unresolved",
+            f"{path}.provenance",
+            f"Provenance IDs must resolve to scoped source/proof/claim/brand records; unresolved: {unresolved}.",
+        )
+        valid = False
+    return valid
+
+
+def _message_unit_role_justification(unit: dict[str, Any]) -> str | None:
+    for key in ("role_justification", "justification", "rationale", "reason"):
+        value = unit.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _message_unit_is_obviously_decorative(text: str) -> bool:
+    candidate = re.sub(r"\s+", " ", text.strip())
+    if not candidate:
+        return False
+    if MICROCOPY_PAGE_COUNT_RE.fullmatch(candidate) or MICROCOPY_ARROW_RE.fullmatch(candidate):
+        return True
+    if (
+        MICROCOPY_FAKE_ANNOTATION_RE.fullmatch(candidate)
+        or MICROCOPY_FILLER_RE.fullmatch(candidate)
+        or MICROCOPY_REDUNDANT_LABEL_RE.fullmatch(candidate)
+    ):
+        return True
+    return False
+
+
+def _message_unit_decorative_role_allowed(text: str, role: str | None, role_is_justified: bool) -> bool:
+    """Allow only semantically matching, provenance-backed exceptions."""
+
+    if not role_is_justified:
+        return False
+    candidate = re.sub(r"\s+", " ", text.strip())
+    if MICROCOPY_PAGE_COUNT_RE.fullmatch(candidate) or MICROCOPY_ARROW_RE.fullmatch(candidate):
+        return role == "navigation"
+    if MICROCOPY_FAKE_ANNOTATION_RE.fullmatch(candidate):
+        return role == "annotation"
+    if MICROCOPY_FILLER_RE.fullmatch(candidate):
+        return False
+    if MICROCOPY_REDUNDANT_LABEL_RE.fullmatch(candidate):
+        return role in {"accessibility", "branding", "label", "navigation"}
+    return True
+
+
+def _message_unit_action_allowed(path: str, text: str, role: str | None = "action") -> bool:
+    """Recognize non-empty, non-decorative action copy only on action surfaces."""
+
+    if role != "action":
+        return False
+    field = path.rsplit(".", 1)[-1].casefold() if isinstance(path, str) else ""
+    action_path = field in {"cta", "action", "button", "link", "next", "previous", "prev", "submit"}
+    candidate = re.sub(r"\s+", " ", text.strip())
+    has_words = bool(re.search(r"[\w]", candidate, flags=re.UNICODE))
+    return action_path and len(candidate) >= 2 and has_words and not _message_unit_is_obviously_decorative(candidate)
+
+
+def _message_unit_role_evidence(
+    path: str,
+    unit: dict[str, Any],
+    role: str | None,
+    spec: dict[str, Any],
+    authority: dict[str, Any] | None,
+) -> bool:
+    """Require role-specific semantics bound to content or approved brand assets."""
+
+    if role == "label":
+        for key in ("label_for", "target_field", "control_id", "for"):
+            target = unit.get(key)
+            if isinstance(target, str) and target.startswith("$"):
+                exists, value = _resolve_json_path(spec, target)
+                if exists and isinstance(value, str) and value.strip():
+                    return True
+        return False
+    evidence_keys = {
+        "navigation": ("navigation_target", "destination", "destination_path", "href", "target_path", "route"),
+        "accessibility": ("aria_for", "accessibility_target", "assistive_target", "screen_reader_for"),
+    }
+    if role == "branding":
+        approved_assets = _approved_brand_asset_ids(authority)
+        for key in ("brand_asset_id", "brand_asset_ref", "brand_mark_id", "logo_id"):
+            values, valid = _provenance_id_values(unit.get(key)) if key in unit else ([], False)
+            if valid and values and set(values).issubset(approved_assets):
+                return True
+        return False
+    if role in {"navigation", "accessibility"}:
+        for key in evidence_keys[role]:
+            target = unit.get(key)
+            if not isinstance(target, str) or not target.strip():
+                continue
+            if target.startswith("$"):
+                exists, value = _resolve_json_path(spec, target)
+                if exists and (role == "navigation" or isinstance(value, str)):
+                    return True
+            elif key == "href" and _valid_https_url(target):
+                return True
+        return False
+    return True
+
+
+def _message_unit_job_is_distinct(text: str, information_job: str | None) -> bool:
+    """Reject jobs that merely rename a decorative element or its ornament."""
+
+    if not information_job:
+        return False
+    normalized_job = re.sub(r"\s+", " ", information_job.casefold().strip())
+    normalized_text = re.sub(r"\s+", " ", text.casefold().strip())
+    if MICROCOPY_DECORATIVE_JOB_RE.search(normalized_job):
+        return False
+    if normalized_job in {normalized_text, "label", "header", "footer", "annotation", "page count", "page number"}:
+        return False
+    return True
+
+
+def _implicit_message_units(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Represent legacy visible fields for pattern checks and migration hints."""
+
+    units: list[dict[str, Any]] = []
+    slides = spec.get("slides")
+    if isinstance(slides, list):
+        for index, slide in enumerate(slides):
+            if not isinstance(slide, dict):
+                continue
+            for field in ("headline", "body", "cta"):
+                text = slide.get(field)
+                if isinstance(text, str) and text.strip():
+                    units.append(
+                        {
+                            "text": text,
+                            "path": f"$.slides[{index}].{field}",
+                            "information_job": slide.get("information_job"),
+                            "functional_role": "action" if field == "cta" else None,
+                            "_implicit": True,
+                        }
+                    )
+    caption = spec.get("caption")
+    if isinstance(caption, dict):
+        for field in ("hook", "body", "cta"):
+            text = caption.get(field)
+            if isinstance(text, str) and text.strip():
+                units.append(
+                    {
+                        "text": text,
+                        "path": f"$.caption.{field}",
+                        "functional_role": "action" if field == "cta" else None,
+                        "_implicit": True,
+                    }
+                )
+    return units
+
+
+def _declared_message_units(spec: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], bool]:
+    """Collect canonical and nested text manifests without treating text as instructions."""
+
+    declared: list[tuple[str, dict[str, Any]]] = []
+    explicit = False
+    for key in ("message_units", "text_elements"):
+        value = spec.get(key)
+        if value is None:
+            continue
+        explicit = True
+        if not isinstance(value, list):
+            declared.append((f"$.{key}", {"_invalid": value}))
+            continue
+        for index, unit in enumerate(value):
+            declared.append((f"$.{key}[{index}]", unit if isinstance(unit, dict) else {"_invalid": unit}))
+
+    slides = spec.get("slides")
+    if isinstance(slides, list):
+        for index, slide in enumerate(slides):
+            if not isinstance(slide, dict):
+                continue
+            for key in ("message_units", "text_elements"):
+                value = slide.get(key)
+                if value is None:
+                    continue
+                explicit = True
+                if not isinstance(value, list):
+                    declared.append((f"$.slides[{index}].{key}", {"_invalid": value}))
+                    continue
+                for unit_index, unit in enumerate(value):
+                    declared.append(
+                        (
+                            f"$.slides[{index}].{key}[{unit_index}]",
+                            unit if isinstance(unit, dict) else {"_invalid": unit},
+                        )
+                    )
+
+    caption = spec.get("caption")
+    if isinstance(caption, dict):
+        for key in ("message_units", "text_elements"):
+            value = caption.get(key)
+            if value is None:
+                continue
+            explicit = True
+            if not isinstance(value, list):
+                declared.append((f"$.caption.{key}", {"_invalid": value}))
+                continue
+            for unit_index, unit in enumerate(value):
+                declared.append(
+                    (
+                        f"$.caption.{key}[{unit_index}]",
+                        unit if isinstance(unit, dict) else {"_invalid": unit},
+                    )
+                )
+    return declared, explicit
+
+
+def _validate_message_unit_contract(
+    spec: dict[str, Any],
+    state: Any,
+    report: Report,
+    provenance_authority: dict[str, Any] | None = None,
+) -> None:
+    """Require every production text unit to have a job or provenance-backed role.
+
+    The pattern checks are deliberately conservative.  They only flag a short
+    text when it is a known page-count/arrow/filler/annotation pattern or when
+    the same unqualified theme header is repeated.  Source, legal,
+    accessibility, navigation, action, label, branding, and annotation units
+    remain valid when their role is justified and provenance is recorded.
+    """
+
+    production = _anti_slop_route_required(spec, state)
+    declared, explicit = _declared_message_units(spec)
+    for conflict in _message_unit_alias_conflicts(spec):
+        report.error(
+            "message_unit_alias_conflict",
+            conflict,
+            "Declare only one message_units/text_elements manifest alias at each scope; accepting both would make the visible-text contract ambiguous.",
+        )
+    if production and not explicit and _implicit_message_units(spec):
+        report.error(
+            "message_units_required",
+            "$.message_units",
+            "Canva mutation/production requires a message_units (or text_elements) manifest so every visible text element has an information_job or justified functional_role.",
+        )
+    if production and explicit:
+        declared_paths = {
+            _message_unit_path(unit, "")
+            for _, unit in declared
+            if "_invalid" not in unit and _message_unit_path(unit, "")
+        }
+        implicit_paths = {unit["path"] for unit in _implicit_message_units(spec)}
+        missing_paths = sorted(implicit_paths - declared_paths)
+        if missing_paths:
+            report.error(
+                "message_unit_coverage",
+                "$.message_units",
+                "Production message_units must cover every non-empty headline, body, CTA, caption hook, caption body, and caption CTA; missing: "
+                + ", ".join(missing_paths),
+            )
+
+    bound_paths: dict[str, list[str]] = {}
+    for container_path, unit in declared:
+        if "_invalid" in unit:
+            continue
+        bound_path = _message_unit_path(unit, container_path)
+        if bound_path:
+            bound_paths.setdefault(bound_path, []).append(container_path)
+    for bound_path, containers in bound_paths.items():
+        if len(containers) > 1:
+            report.error(
+                "message_unit_duplicate_path",
+                bound_path,
+                "Each visible content path may be declared by only one message unit across top-level and nested manifests/aliases.",
+            )
+
+    units: list[tuple[str, dict[str, Any]]] = list(declared)
+    # Implicit fields support migration warnings and catch obvious decorative
+    # copy even before a production manifest has been added.
+    units.extend((unit["path"], unit) for unit in _implicit_message_units(spec))
+    if not units:
+        return
+
+    normalized_visible: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for path, unit in declared:
+        if "_invalid" in unit:
+            report.error("message_unit_type", path, "Each message unit must be an object.")
+            continue
+        path = _message_unit_path(unit, path)
+        text_key = "text"
+        text = unit.get(text_key)
+        if text_key not in unit:
+            report.error("message_unit_text_required", f"{path}.{text_key}", "Each accepted message unit must declare its canonical text in text.")
+            text = ""
+        elif not isinstance(text, str):
+            report.error("message_unit_text_type", f"{path}.{text_key}", "Visible message-unit text must be a string.")
+            text = ""
+        bound_path = path
+        path_exists, actual_value = _resolve_json_path(spec, bound_path)
+        if not bound_path or not path_exists:
+            report.error("message_unit_path_invalid", f"{path}.path", "Message-unit path must resolve to an existing content field.")
+        elif not isinstance(actual_value, str):
+            report.error("message_unit_path_type", f"{path}.path", "Message-unit path must resolve to a string text value.")
+        elif text != actual_value:
+            report.error("message_unit_text_mismatch", f"{path}.text", "Message-unit text must exactly match the value at its path.")
+        visible = unit.get("visible", True)
+        if not isinstance(visible, bool):
+            report.error("message_unit_visible", f"{path}.visible", "visible must be a boolean when supplied.")
+            visible = True
+        if visible and not text.strip():
+            report.error("message_unit_text", f"{path}.text", "Visible message units require non-empty text.")
+            continue
+        if not visible and isinstance(actual_value, str) and actual_value.strip():
+            report.error(
+                "message_unit_visibility_mismatch",
+                f"{path}.visible",
+                "visible:false cannot suppress canonical visible copy; resolve the path and classify the actual text with its job or functional role.",
+            )
+            visible = True
+        if not visible:
+            continue
+        if not _nonempty_string(_message_unit_path(unit, "")):
+            report.error("message_unit_location", path, "Each visible message unit needs a stable path or location.")
+        job = _message_unit_information_job(unit)
+        role = _message_unit_role(unit)
+        justification = _message_unit_role_justification(unit)
+        has_job = _message_unit_job_is_distinct(text, job)
+        if role is not None and role not in MICROCOPY_FUNCTIONAL_ROLES:
+            report.error(
+                "message_unit_functional_role",
+                f"{path}.functional_role",
+                f"Functional role must be one of: {', '.join(sorted(MICROCOPY_FUNCTIONAL_ROLES))}.",
+            )
+        provenance_valid = _validate_message_unit_provenance(unit, path, spec, role, report, provenance_authority) if role is not None or "provenance" in unit else True
+        role_evidence_valid = True
+        if role in {"label", "navigation", "accessibility", "branding"}:
+            role_evidence_valid = _message_unit_role_evidence(path, unit, role, spec, provenance_authority)
+            if not role_evidence_valid:
+                report.error(
+                    "message_unit_role_evidence",
+                    f"{path}.functional_role",
+                    "Role-specific evidence must resolve to a content target or an approved brand asset; a self-attested ID is not sufficient.",
+                )
+        role_is_justified = role in MICROCOPY_FUNCTIONAL_ROLES and bool(justification) and provenance_valid and role_evidence_valid
+        if role == "action" and not _message_unit_action_allowed(path, text):
+            report.error(
+                "message_unit_action_semantics",
+                f"{path}.functional_role",
+                "An action role is valid only for an actual CTA/action surface with action-shaped copy; it cannot bypass a repeated or generic header check.",
+            )
+            role_is_justified = False
+        if role is not None and role in MICROCOPY_FUNCTIONAL_ROLES and not justification:
+            report.error(
+                "message_unit_role_justification",
+                f"{path}.role_justification",
+                "A functional role needs a concrete justification explaining the information, action, accessibility, or navigation job.",
+            )
+        if role in {"source", "legal", "accessibility", "navigation", "label", "branding", "annotation"} and not provenance_valid:
+            report.error(
+                "message_unit_provenance",
+                f"{path}.provenance",
+                "Source/legal/accessibility/navigation/label/branding/annotation text needs provenance that resolves to an approved source, claim, policy, or brand record.",
+            )
+        if production and not (has_job or role_is_justified):
+            report.error(
+                "message_unit_information_job_missing",
+                f"{path}.information_job",
+                "Every visible production text element needs a distinct information_job or a justified functional_role; decorative text cannot occupy space without a job.",
+            )
+        elif not (has_job or role_is_justified):
+            report.warning(
+                "message_unit_information_job_missing",
+                f"{path}.information_job",
+                "Record the information_job or a justified functional_role before Canva production; visible decorative text is not a content job.",
+            )
+        obviously_decorative = _message_unit_is_obviously_decorative(text)
+        if obviously_decorative and (
+            not _message_unit_decorative_role_allowed(text, role, role_is_justified)
+            or (role in {"label", "navigation", "accessibility", "branding"} and not _message_unit_role_evidence(path, unit, role, spec, provenance_authority))
+        ):
+            severity = report.error if production else report.warning
+            severity(
+                "REDUNDANT_DECORATIVE_MICROCOPY",
+                path,
+                "This small text matches a page-count, arrow, filler, or fake-annotation pattern but records no distinct information, action, accessibility, or navigation job.",
+            )
+        if obviously_decorative and job and not has_job and not role_is_justified:
+            severity = report.error if production else report.warning
+            severity(
+                "REDUNDANT_DECORATIVE_MICROCOPY",
+                path,
+                "The recorded job is decorative or merely repeats the text; replace it with a distinct job or remove the text.",
+            )
+        if not obviously_decorative:
+            normalized_visible.setdefault(re.sub(r"\s+", " ", text.casefold().strip()), []).append((path, unit))
+
+    # Repeated theme headers are only a finding when no unit has a distinct job
+    # or a justified functional role.  Repeated CTAs, source labels, legal
+    # notices, and navigation metadata therefore remain valid by contract.
+    for text, matches in normalized_visible.items():
+        if len(matches) < 2:
+            continue
+        jobs = {
+            re.sub(r"\s+", " ", (_message_unit_information_job(unit) or "").casefold().strip())
+            for _, unit in matches
+        }
+        cta_repeat = (
+            all(path.endswith(".cta") and _message_unit_action_allowed(path, _message_unit_text(unit)) for path, unit in matches)
+            and len(jobs - {""}) == len(matches)
+        )
+        role_repeat = all(
+            (_message_unit_role(unit) == "action" and _message_unit_action_allowed(path, _message_unit_text(unit)))
+            or (_message_unit_role(unit) in {"source", "legal", "accessibility", "navigation", "label", "branding"}
+                and _message_unit_role_justification(unit)
+                and _validate_message_unit_provenance(unit, path, spec, _message_unit_role(unit), report, provenance_authority)
+                and _message_unit_role_evidence(path, unit, _message_unit_role(unit), spec, provenance_authority)
+            )
+            for path, unit in matches
+        )
+        if cta_repeat or role_repeat:
+            continue
+        for path, unit in matches:
+            severity = report.error if production else report.warning
+            severity(
+                "REDUNDANT_DECORATIVE_MICROCOPY",
+                path,
+                "This visible label repeats a theme header without a distinct information job; remove it or document its functional role and provenance.",
+            )
+
+    if not explicit:
+        implicit_visible: dict[str, list[dict[str, Any]]] = {}
+        for unit in _implicit_message_units(spec):
+            text = unit["text"]
+            if _message_unit_is_obviously_decorative(text):
+                severity = report.error if production else report.warning
+                severity(
+                    "REDUNDANT_DECORATIVE_MICROCOPY",
+                    unit["path"],
+                    "Visible microcopy matches a decorative page-count, arrow, filler, or fake-annotation pattern but has no declared information_job or functional role.",
+                )
+            implicit_visible.setdefault(re.sub(r"\s+", " ", text.casefold().strip()), []).append(unit)
+        for text, matches in implicit_visible.items():
+            if len(matches) < 2:
+                continue
+            # Existing slide-level information_job is not enough to justify a
+            # repeated theme header: the header itself needs a job or role.
+            if any(_message_unit_is_obviously_decorative(unit["text"]) for unit in matches):
+                continue
+            if all(
+                unit.get("functional_role") == "action"
+                and _message_unit_action_allowed(unit["path"], unit["text"])
+                for unit in matches
+            ):
+                continue
+            severity = report.error if production else report.warning
+            for unit in matches:
+                severity(
+                    "REDUNDANT_DECORATIVE_MICROCOPY",
+                    unit["path"],
+                    "Visible text repeats across message units without a field-level job or functional role; it appears to be a decorative theme header.",
+                )
+
+
+def _declared_extra_message_units(spec: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Return manifest text not already represented by canonical copy fields."""
+
+    known_paths = {unit["path"] for unit in _implicit_message_units(spec)}
+    extras: list[tuple[str, dict[str, Any]]] = []
+    declared, _ = _declared_message_units(spec)
+    for container_path, unit in declared:
+        if "_invalid" in unit:
+            continue
+        path = _message_unit_path(unit, container_path)
+        if path in known_paths:
+            continue
+        text = _message_unit_text(unit)
+        if text.strip() and unit.get("visible", True) is not False:
+            extras.append((path, unit))
+    return extras
+
+
+def _message_manifest_for_checksum(spec: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Canonicalize accepted units; return None to preserve legacy hashes."""
+
+    declared, explicit = _declared_message_units(spec)
+    if not explicit:
+        return None
+    return [
+        {"container_path": container_path, "path": _message_unit_path(unit, container_path), "unit": unit}
+        for container_path, unit in declared
+    ]
+
+
 def _all_content_text(spec: dict[str, Any]) -> str:
     chunks = [str(spec.get("single_message", ""))]
     for slide in spec.get("slides", []) if isinstance(spec.get("slides"), list) else []:
@@ -1373,6 +2143,7 @@ def _all_content_text(spec: dict[str, Any]) -> str:
     caption = spec.get("caption")
     if isinstance(caption, dict):
         chunks.extend(str(caption.get(key, "")) for key in ("hook", "body", "cta"))
+    chunks.extend(_message_unit_text(unit) for _, unit in _declared_extra_message_units(spec))
     return "\n".join(chunks)
 
 
@@ -1397,6 +2168,7 @@ def _indonesian_text_units(spec: dict[str, Any]) -> list[tuple[str, str]]:
             value = caption.get(key)
             if _nonempty_string(value):
                 units.append((f"$.caption.{key}", value))
+    units.extend((_message_unit_path(unit, path), _message_unit_text(unit)) for path, unit in _declared_extra_message_units(spec))
     return units
 
 
@@ -1708,6 +2480,12 @@ def _visible_copy_digest(spec: dict[str, Any]) -> str:
         "slides": slides,
         "caption": spec.get("caption"),
     }
+    _, explicit = _declared_message_units(spec)
+    if explicit:
+        payload["extra_message_units"] = [
+            {"path": path, "text": _message_unit_text(unit)}
+            for path, unit in _declared_extra_message_units(spec)
+        ]
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -2635,6 +3413,9 @@ def _anti_slop_package_checksum(spec: dict[str, Any], audit: dict[str, Any]) -> 
         "render_digest": package.get("render_digest"),
         "export_checksum": export_checksum,
     }
+    manifest = _message_manifest_for_checksum(spec)
+    if manifest is not None:
+        payload["message_units"] = manifest
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -2645,12 +3426,14 @@ def _validate_anti_slop_audit(
     state: Any,
     template_entries: list[dict[str, Any]],
     report: Report,
+    provenance_authority: dict[str, Any] | None = None,
 ) -> None:
     routes = _validate_route_set(spec, expected_scope, state, report)
     selected_route_id = _validate_human_selected_route(spec, routes, expected_scope, state, report)
     _validate_art_direction(spec, selected_route_id, state, report)
     _validate_production_controls(spec, expected_scope, template_entries, state, report)
     _validate_page_contract(spec, spec.get("source_packet"), state, report)
+    _validate_message_unit_contract(spec, state, report, provenance_authority)
 
     required = _anti_slop_route_required(spec, state)
     audit = spec.get("anti_slop_audit")
@@ -3048,6 +3831,9 @@ def calculate_package_checksum(spec: dict[str, Any]) -> str | None:
         "scheduled_at": publishing.get("scheduled_at"),
         "timezone": publishing.get("timezone"),
     }
+    manifest = _message_manifest_for_checksum(spec)
+    if manifest is not None:
+        payload["message_units"] = manifest
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -3911,7 +4697,7 @@ def validate_content_spec(
         policy=policy,
         actor_id=actor_id,
     )
-    _validate_anti_slop_audit(spec, canonical_scope, state, template_entries, report)
+    _validate_anti_slop_audit(spec, canonical_scope, state, template_entries, report, bundle)
 
     return report
 

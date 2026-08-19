@@ -409,6 +409,37 @@ def make_approved_spec() -> dict:
     for slide in spec["slides"]:
         slide["information_job"] = f"Fixture information job for slide {slide['slide']}"
         slide["progression"] = f"Advances the fixture sequence to slide {slide['slide']}."
+    spec["message_units"] = []
+    for slide_index, slide in enumerate(spec["slides"]):
+        for field in ("headline", "body", "cta"):
+            if not slide.get(field):
+                continue
+            spec["message_units"].append(
+                {
+                    "path": f"$.slides[{slide_index}].{field}",
+                    "text": slide[field],
+                    "information_job": f"Fixture {field} job for slide {slide['slide']}",
+                    "provenance": {"kind": "creative_brief", "ref": "brief_version:1.0"},
+                }
+            )
+    for field in ("hook", "body", "cta"):
+        if not spec["caption"].get(field):
+            continue
+        unit = {
+            "path": f"$.caption.{field}",
+            "text": spec["caption"][field],
+            "information_job": f"Fixture caption {field} job",
+            "provenance": {"kind": "creative_brief", "ref": "brief_version:1.0"},
+        }
+        if field == "cta":
+            unit.update(
+                {
+                    "functional_role": "action",
+                    "role_justification": "Names the single next action for the reader.",
+                }
+            )
+        spec["message_units"].append(unit)
+    spec["copy_quality_audit"]["indonesian_review"]["reviewed_copy_digest"] = _visible_copy_digest(spec)
     audit["status"] = "pass"
     audit["evidence"] = {
         "ocr": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "exact_match": True},
@@ -545,6 +576,303 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("id_copy_review_required", codes)
         self.assertIn("slide_information_job_missing", codes)
 
+    def test_production_decorative_microcopy_requires_a_job(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["extra_text"] = [{"text": "Page 1 of 5"}]
+        spec["message_units"].append(
+            {
+                "path": "$.slides[0].extra_text[0].text",
+                "text": "Page 1 of 5",
+            }
+        )
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("REDUNDANT_DECORATIVE_MICROCOPY", codes)
+        self.assertIn("message_unit_information_job_missing", codes)
+
+    def test_visible_false_cannot_hide_canonical_text(self) -> None:
+        spec = make_approved_spec()
+        spec["message_units"][0]["visible"] = False
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("message_unit_visibility_mismatch", {issue.code for issue in report.errors})
+
+    def test_self_attested_job_does_not_legalize_decorative_patterns(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["extra_text"] = [{"text": "Page 1 of 5"}, {"text": "→"}]
+        spec["message_units"].extend(
+            [
+                {
+                    "path": "$.slides[0].extra_text[0].text",
+                    "text": "Page 1 of 5",
+                    "information_job": "Shows the page count",
+                },
+                {
+                    "path": "$.slides[0].extra_text[1].text",
+                    "text": "→",
+                    "information_job": "Adds visual direction",
+                },
+            ]
+        )
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertGreaterEqual(
+            sum(issue.code == "REDUNDANT_DECORATIVE_MICROCOPY" for issue in report.errors),
+            2,
+        )
+
+        spec = make_approved_spec()
+        spec["slides"][1]["headline"] = spec["slides"][2]["headline"] = "Panduan Data"
+        for unit in spec["message_units"]:
+            if unit["path"] == "$.slides[1].headline":
+                unit["text"] = "Panduan Data"
+                unit["information_job"] = "Introduces the context"
+            if unit["path"] == "$.slides[2].headline":
+                unit["text"] = "Panduan Data"
+                unit["information_job"] = "Introduces the next step"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("REDUNDANT_DECORATIVE_MICROCOPY", {issue.code for issue in report.errors})
+
+    def test_message_unit_path_must_exist_and_match_text(self) -> None:
+        invalid = make_approved_spec()
+        invalid["message_units"][0]["path"] = "$.slides[99].headline"
+        report = validate_content_spec(invalid, approved_brand(), self.TODAY, trusted_policy(invalid), actor_id="lead-fixture")
+        self.assertIn("message_unit_path_invalid", {issue.code for issue in report.errors})
+
+        mismatch = make_approved_spec()
+        mismatch["message_units"][0]["text"] = "Different text"
+        report = validate_content_spec(mismatch, approved_brand(), self.TODAY, trusted_policy(mismatch), actor_id="lead-fixture")
+        self.assertIn("message_unit_text_mismatch", {issue.code for issue in report.errors})
+
+    def test_malformed_or_unresolved_provenance_is_reported(self) -> None:
+        malformed = make_approved_spec()
+        unit = malformed["message_units"][0]
+        unit.update(
+            {
+                "functional_role": "source",
+                "role_justification": "Identifies the evidence source.",
+                "provenance": {"source_ids": [None]},
+            }
+        )
+        report = validate_content_spec(malformed, approved_brand(), self.TODAY, trusted_policy(malformed), actor_id="lead-fixture")
+        self.assertIn("message_unit_provenance_type", {issue.code for issue in report.errors})
+
+        unresolved = make_approved_spec()
+        unit = unresolved["message_units"][0]
+        unit.update(
+            {
+                "functional_role": "source",
+                "role_justification": "Identifies the evidence source.",
+                "provenance": {"source_ids": ["proof-checklist"]},
+            }
+        )
+        report = validate_content_spec(unresolved, approved_brand(), self.TODAY, trusted_policy(unresolved), actor_id="lead-fixture")
+        self.assertIn("message_unit_provenance_unresolved", {issue.code for issue in report.errors})
+
+    def test_message_unit_aliases_cannot_be_supplied_together(self) -> None:
+        spec = make_approved_spec()
+        spec["text_elements"] = [dict(spec["message_units"][0])]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("message_unit_alias_conflict", {issue.code for issue in report.errors})
+
+    def test_manifest_checksum_binding_preserves_legacy_hashes(self) -> None:
+        spec = make_approved_spec()
+        original = calculate_package_checksum(spec)
+        spec["message_units"][0]["information_job"] += " changed"
+        self.assertNotEqual(original, calculate_package_checksum(spec))
+
+        legacy = make_approved_spec()
+        legacy.pop("message_units")
+        legacy["copy_quality_audit"]["indonesian_review"]["reviewed_copy_digest"] = _visible_copy_digest(legacy)
+        legacy["anti_slop_audit"]["approval_package"]["checksum"] = _anti_slop_package_checksum(legacy, legacy["anti_slop_audit"])
+        legacy["approval"]["package_checksum"] = calculate_package_checksum(legacy)
+        self.assertEqual("sha256:568aaccf8467f7bf7d1084f615fb32a993f1ead58d689c3f09a3d794f8f0d671", calculate_package_checksum(legacy))
+
+    def test_draft_decorative_microcopy_is_a_warning_for_migration(self) -> None:
+        spec = load_json("content-spec.example.json")
+        spec["slides"][0]["extra_text"] = [{"text": "→"}]
+        spec["text_elements"] = [{"path": "$.slides[0].extra_text[0].text", "text": "→"}]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("REDUNDANT_DECORATIVE_MICROCOPY", {issue.code for issue in report.warnings})
+        self.assertFalse(any(issue.code == "REDUNDANT_DECORATIVE_MICROCOPY" for issue in report.errors))
+
+    def test_provenance_backed_functional_microcopy_is_not_false_positive(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["extra_text"] = [
+            {"text": "Sumber: checklist layanan"},
+            {"text": "Halaman 1 dari 5"},
+            {"text": "© 2026 Sample Publisher"},
+        ]
+        spec["message_units"].extend(
+            [
+                {
+                    "path": "$.slides[0].extra_text[0].text",
+                    "text": "Sumber: checklist layanan",
+                    "functional_role": "source",
+                    "role_justification": "Lets the reader verify the evidence behind the guide.",
+                    "provenance": {"source_ids": ["source-1"]},
+                },
+                {
+                    "path": "$.slides[0].extra_text[1].text",
+                    "text": "Halaman 1 dari 5",
+                    "functional_role": "navigation",
+                    "role_justification": "Tells the reader where they are in the carousel.",
+                    "navigation_target": "$.slides[1]",
+                    "provenance": {"kind": "render_navigation", "ref": "source-1"},
+                },
+                {
+                    "path": "$.slides[0].extra_text[2].text",
+                    "text": "© 2026 Sample Publisher",
+                    "functional_role": "legal",
+                    "role_justification": "Identifies the rights notice required on the export.",
+                    "provenance": {"kind": "approved_policy", "ref": "source-1"},
+                },
+            ]
+        )
+        report = validate_content_spec(
+            spec,
+            approved_brand(),
+            self.TODAY,
+            trusted_policy(spec),
+            actor_id="lead-fixture",
+            brand_bundle=neutral_brand_bundle(),
+        )
+        self.assertNotIn("REDUNDANT_DECORATIVE_MICROCOPY", {issue.code for issue in report.issues})
+
+    def test_repeated_theme_headers_are_flagged_but_repeated_ctas_are_not(self) -> None:
+        spec = load_json("content-spec.example.json")
+        spec["slides"][1]["headline"] = "Panduan Data"
+        spec["slides"][2]["headline"] = "Panduan Data"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("REDUNDANT_DECORATIVE_MICROCOPY", {issue.code for issue in report.warnings})
+
+        spec = load_json("content-spec.example.json")
+        spec["slides"][0]["extra_text"] = [{"text": "Overview"}]
+        spec["text_elements"] = [{"path": "$.slides[0].extra_text[0].text", "text": "Overview"}]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("REDUNDANT_DECORATIVE_MICROCOPY", {issue.code for issue in report.warnings})
+
+        spec = load_json("content-spec.example.json")
+        spec["slides"][1]["cta"] = "Simpan panduan ini."
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertNotIn("REDUNDANT_DECORATIVE_MICROCOPY", {issue.code for issue in report.warnings})
+
+    def test_action_role_cannot_exempt_repeated_headers(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][1]["headline"] = spec["slides"][2]["headline"] = "Panduan Data"
+        for unit in spec["message_units"]:
+            if unit["path"] in {"$.slides[1].headline", "$.slides[2].headline"}:
+                unit.update(
+                    {
+                        "text": "Panduan Data",
+                        "functional_role": "action",
+                        "role_justification": "Moves the reader forward.",
+                    }
+                )
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("message_unit_action_semantics", codes)
+        self.assertIn("REDUNDANT_DECORATIVE_MICROCOPY", codes)
+
+    def test_generic_labels_need_role_specific_evidence_and_authority(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["extra_text"] = [
+            {"text": "Overview"},
+            {"text": "Guide"},
+            {"text": "Panduan"},
+        ]
+        roles = ("label", "navigation", "branding")
+        for index, role in enumerate(roles):
+            spec["message_units"].append(
+                {
+                    "path": f"$.slides[0].extra_text[{index}].text",
+                    "text": spec["slides"][0]["extra_text"][index]["text"],
+                    "functional_role": role,
+                    "role_justification": "Keeps the small text visible for the reader.",
+                    "provenance": {"brand_id": "sample-brand"},
+                }
+            )
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertGreaterEqual(sum(issue.code == "REDUNDANT_DECORATIVE_MICROCOPY" for issue in report.errors), 3)
+        self.assertIn("message_unit_provenance_unresolved", codes)
+
+    def test_mutable_source_packet_id_cannot_authorize_functional_microcopy(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["extra_text"] = [{"text": "Sumber: checklist layanan"}]
+        spec["message_units"].append(
+            {
+                "path": "$.slides[0].extra_text[0].text",
+                "text": "Sumber: checklist layanan",
+                "functional_role": "source",
+                "role_justification": "Lets the reader verify the source.",
+                "provenance": {"source_ids": ["proof-checklist"]},
+            }
+        )
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("message_unit_provenance_unresolved", {issue.code for issue in report.errors})
+
+    def test_duplicate_message_unit_paths_across_nested_aliases_are_rejected(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["text_elements"] = [dict(spec["message_units"][0])]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("message_unit_duplicate_path", {issue.code for issue in report.errors})
+
+    def test_common_indonesian_and_english_ctas_are_not_verb_heuristic_false_positives(self) -> None:
+        for phrase in ("Buat akun", "Daftar", "Join us", "Lihat detail", "Ayo mulai"):
+            spec = make_approved_spec()
+            spec["slides"][1]["cta"] = spec["slides"][2]["cta"] = phrase
+            for index in (1, 2):
+                spec["message_units"].append(
+                    {
+                        "path": f"$.slides[{index}].cta",
+                        "text": phrase,
+                        "functional_role": "action",
+                        "role_justification": "Offers the reader the next concrete action.",
+                    }
+                )
+            report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+            codes = {issue.code for issue in report.errors}
+            self.assertNotIn("message_unit_action_semantics", codes, phrase)
+            self.assertNotIn("REDUNDANT_DECORATIVE_MICROCOPY", codes, phrase)
+
+    def test_role_evidence_must_bind_targets_and_brand_assets(self) -> None:
+        spec = make_approved_spec()
+        spec["slides"][0]["extra_text"] = [
+            {"text": "Overview"},
+            {"text": "Overview"},
+            {"text": "Guide"},
+            {"text": "Panduan"},
+            {"text": "Catatan"},
+            {"text": "See more"},
+        ]
+        units = (
+            ("navigation", "navigation_target", "slide-2"),
+            ("navigation", "navigation_target", "slide-3"),
+            ("accessibility", "aria_for", "headline"),
+            ("branding", "brand_asset_id", "unapproved-asset"),
+            ("label", "label_for", "headline"),
+            ("navigation", "navigation_target", "slide-4"),
+        )
+        for index, (role, evidence_key, evidence_value) in enumerate(units):
+            spec["message_units"].append(
+                {
+                    "path": f"$.slides[0].extra_text[{index}].text",
+                    "text": spec["slides"][0]["extra_text"][index]["text"],
+                    "functional_role": role,
+                    "role_justification": "The small text identifies a real interface relationship.",
+                    evidence_key: evidence_value,
+                    "provenance": {"source_ids": ["source-1"]},
+                }
+            )
+        report = validate_content_spec(
+            spec,
+            approved_brand(),
+            self.TODAY,
+            trusted_policy(spec),
+            actor_id="lead-fixture",
+            brand_bundle=neutral_brand_bundle(),
+        )
+        self.assertGreaterEqual(sum(issue.code == "REDUNDANT_DECORATIVE_MICROCOPY" for issue in report.errors), 5)
+
     def test_malformed_copy_reason_code_is_reported_without_crashing(self) -> None:
         spec = self.id_copy_spec("Kami menyediakan panduan.")
         spec["state"] = "BRAND_QA"
@@ -630,7 +958,7 @@ class ValidatorTests(unittest.TestCase):
 
     def test_approval_checksum_matches_independent_golden_literal(self) -> None:
         spec = make_approved_spec()
-        self.assertEqual("sha256:568aaccf8467f7bf7d1084f615fb32a993f1ead58d689c3f09a3d794f8f0d671", calculate_package_checksum(spec))
+        self.assertEqual("sha256:4c56c3d292db781a5b7635248ed722f7736166adec16f92315d0168e91481b26", calculate_package_checksum(spec))
 
     def test_early_example_passes_with_approved_brand(self) -> None:
         spec = load_json("content-spec.example.json")
