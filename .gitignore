@@ -1,0 +1,27 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Hermes and runtime state (never part of a release)
+hermes-runtime/
+.env
+.env.*
+*.token
+*.secret
+*.credentials
+runtime/
+exports/
+receipts/
+cache/
+caches/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

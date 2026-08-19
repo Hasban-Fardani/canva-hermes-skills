@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.1",
+  "brand_id": "",
+  "scope": {
+    "tenant_id": "",
+    "client_id": "",
+    "product_id": null,
+    "parent_brand_revision": null
+  },
+  "revision": "",
+  "status": "draft",
+  "sources": [],
+  "evidence_ledger": [],
+  "authorization": {
+    "owner": "",
+    "scope": "",
+    "expires_at": "",
+    "status": "unverified",
+    "actor_id": "",
+    "role": "",
+    "verified": false,
+    "policy_source": "local_authenticated_policy",
+    "policy_id": "",
+    "policy_revision": ""
+  },
+  "update": {
+    "operation": "capture",
+    "created_at": "",
+    "validated_at": "",
+    "activated_at": "",
+    "receipt": ""
+  }
+}

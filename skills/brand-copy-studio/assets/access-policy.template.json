@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "policy_id": "policy-example",
+  "revision": "2026-01-01T000000Z-r1",
+  "source": "local_authenticated_policy",
+  "scope": {
+    "tenant_id": "tenant-example",
+    "client_id": "client-example",
+    "brand_id": "brand-example",
+    "product_id": null
+  },
+  "role_mapping": {
+    "lead": [],
+    "admin": [],
+    "member": [],
+    "reviewer": [],
+    "publisher": []
+  }
+}

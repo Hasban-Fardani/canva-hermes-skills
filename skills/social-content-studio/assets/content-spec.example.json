@@ -1,0 +1,269 @@
+{
+  "schema_version": "1.1",
+  "content_id": "GEN-2026-08-CONTENT-001",
+  "campaign_id": "education-workflow-2026-q3",
+  "brief_version": "1.0",
+  "copy_version": "1.0-draft",
+  "state": "COPY_REVIEW",
+  "scope": {
+    "tenant_id": "sample-tenant",
+    "client_id": "sample-client",
+    "product_id": "sample-product"
+  },
+  "brand_id": "sample-brand",
+  "copy_recipe_id": null,
+  "copy_recipe_version": null,
+  "brand_revision": null,
+  "platform": "instagram",
+  "format": "carousel",
+  "objective": "education",
+  "audience": "Orang yang baru mulai menata dokumen untuk sebuah proses layanan",
+  "content_pillar": "education: process preparation",
+  "single_message": "Persiapan data yang rapi membantu pembaca memahami langkah awal sebuah proses.",
+  "source_context": {
+    "brief": "Draft edukasi awal; semua pernyataan teknis atau regulasi harus ditautkan ke sumber sebelum approval.",
+    "source_urls": [
+      "https://example.com/source/brief",
+      "https://example.com/source/policy"
+    ],
+    "retrieved_at": "2026-08-19T09:00:00+07:00",
+    "external_content_treated_as_data": true
+  },
+  "experiment": {
+    "experiment_id": null,
+    "hypothesis": null,
+    "variable": "none",
+    "variant": "control",
+    "primary_metric": null,
+    "guardrails": [],
+    "stop_rule": null
+  },
+  "slides": [
+    {
+      "slide": 1,
+      "role": "cover",
+      "headline": "Mulai Proses dari Data yang Rapi",
+      "body": "",
+      "cta": "",
+      "visual_direction": "Headline besar pada reading surface terang; satu ilustrasi dokumen; footer identitas tetap.",
+      "accessibility_note": "Pastikan headline kontras tinggi dan tidak bertumpuk dengan ilustrasi."
+    },
+    {
+      "slide": 2,
+      "role": "context",
+      "headline": "Kenapa Persiapan Data Penting?",
+      "body": "Informasi yang tidak konsisten membuat pembaca sulit mengetahui data mana yang perlu dicek lebih dulu.",
+      "cta": "",
+      "visual_direction": "Dua kolom sederhana: data terpencar dan data terstruktur; tanpa foto dekoratif.",
+      "accessibility_note": "Gunakan label teks selain perbedaan warna."
+    },
+    {
+      "slide": 3,
+      "role": "steps",
+      "headline": "Susun Informasi Dasar",
+      "body": "Kelompokkan data pemilik, lokasi, dan dokumen yang memang diminta pada proses yang berlaku.",
+      "cta": "",
+      "visual_direction": "Tiga kartu bernomor dengan ikon dari satu keluarga visual.",
+      "accessibility_note": "Nomor dan judul kartu menentukan urutan baca."
+    },
+    {
+      "slide": 4,
+      "role": "proof",
+      "headline": "Cek Sebelum Diajukan",
+      "body": "Bandingkan kembali nama, lokasi, dan data utama. Tandai bagian yang masih membutuhkan sumber atau konfirmasi.",
+      "cta": "",
+      "visual_direction": "Checklist ringkas dengan satu tanda per baris dan ruang putih yang cukup.",
+      "accessibility_note": "Setiap status memiliki kata, bukan tanda warna saja."
+    },
+    {
+      "slide": 5,
+      "role": "cta",
+      "headline": "Buat Proses Lebih Mudah Ditelusuri",
+      "body": "Simpan catatan sumber dan perubahan agar koreksi tidak dimulai dari awal.",
+      "cta": "Simpan panduan ini.",
+      "visual_direction": "Satu CTA pada kartu merah, tanpa elemen promosi kedua.",
+      "accessibility_note": "CTA berbentuk teks jelas dengan kontras tinggi."
+    }
+  ],
+  "caption": {
+    "hook": "Sebuah proses sebaiknya tidak dimulai dari menebak dokumen.",
+    "body": "Susun dulu informasi pemilik, lokasi, dan data utama yang relevan. Lalu cek konsistensinya dan tandai bagian yang masih membutuhkan sumber resmi atau konfirmasi. Cara ini membuat proses lebih mudah ditelusuri ketika ada koreksi.",
+    "cta": "Simpan panduan ini.",
+    "hashtags": [
+      "#Persiapan",
+      "#Checklist",
+      "#Dokumen"
+    ]
+  },
+  "alt_text": "Carousel dengan lima langkah ringkas untuk menata data sebelum memulai sebuah proses, menggunakan kartu checklist dan satu ajakan untuk menyimpan panduan.",
+  "claims": [],
+  "design": {
+    "template_id": null,
+    "template_version": null,
+    "provider": "canva",
+    "provider_template_id": null,
+    "canva_template_id": null,
+    "dimensions": {
+      "width": 1080,
+      "height": 1350
+    },
+    "safe_area_px": 64,
+    "draft_ref": null,
+    "render_ref": null,
+    "remote_scope": null,
+    "canva_design_id": null,
+    "canva_design_url": null,
+    "export_checksum": null,
+    "download": {
+      "status": "not_started",
+      "scope": null,
+      "local_path": null,
+      "sha256": null,
+      "receipt": null
+    }
+  },
+  "template_registry": {
+    "entries": []
+  },
+  "policy": {
+    "schema_version": "1.0",
+    "policy_id": "sample-social-policy",
+    "revision": "2026-08-19T000000Z-r1",
+    "source": "local_authenticated_policy",
+    "scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand"
+    },
+    "identity_source": "local_authenticated_policy",
+    "actor_id": "member-fixture",
+    "actor_role": "member",
+    "role_mapping": {
+      "admin": ["admin-fixture"],
+      "lead": ["lead-fixture"],
+      "reviewer": ["reviewer-fixture"],
+      "member": ["member-fixture"],
+      "publisher": ["publisher-fixture"]
+    },
+    "approval_required": true,
+    "mode": "attended",
+    "unattended": {
+      "enabled": false,
+      "policy_id": "sample-social-policy",
+      "policy_revision": "2026-08-19T000000Z-r1",
+      "scope": null,
+      "enabled_by": null,
+      "enabled_by_role": null,
+      "enabled_at": null,
+      "preapproved": {
+        "copy_recipe_ids": [],
+        "copy_recipe_versions": {},
+        "copy_recipe_brand_revisions": {},
+        "template_ids": [],
+        "template_versions": {},
+        "template_provider_ids": {},
+        "claim_ids": [],
+        "targets": [],
+        "pillars": ["education: process preparation"],
+        "formats": ["carousel"],
+        "field_budgets": {
+          "headline_chars": 60,
+          "body_chars": 220,
+          "cta_chars": 50,
+          "caption_chars": 2200,
+          "alt_text_chars": 1000,
+          "hashtags_max": 10,
+          "slides_max": 10
+        }
+      }
+    }
+  },
+  "qa": {
+    "copy": "pending",
+    "brand": "pending",
+    "visual": "pending",
+    "accessibility": "pending",
+    "claims": "pending",
+    "mobile_thumbnail": "pending",
+    "notes": [
+      "Exact colors and fonts are intentionally unverified in the draft brand profile.",
+      "Visual checks must wait for an actual render."
+    ]
+  },
+  "approval": {
+    "status": "not_requested",
+    "approver": null,
+    "approved_at": null,
+    "scope": null,
+    "scope_ids": null,
+    "approver_id": null,
+    "approver_role": null,
+    "identity_source": null,
+    "policy_id": null,
+    "policy_revision": null,
+    "package_checksum": null
+  },
+  "publishing": {
+    "target_account": "account-placeholder",
+    "scheduled_at": null,
+    "timezone": "Asia/Jakarta",
+    "remote_scope": null,
+    "idempotency_key": null,
+    "publisher_id": null,
+    "publisher_role": null,
+    "policy_id": null,
+    "policy_revision": null,
+    "package_checksum": null,
+    "preflight_checked_at": null,
+    "preflight": {
+      "duplicate_check": "pending",
+      "kill_switch": "pending",
+      "account_access": "pending",
+      "asset_rights": "pending"
+    },
+    "media_id": null,
+    "published_at": null,
+    "public_url": null,
+    "utm": {
+      "source": null,
+      "medium": null,
+      "campaign": null,
+      "content": null
+    }
+  },
+  "measurement": {
+    "plan": {
+      "pillar": "education: process preparation",
+      "primary_metric": "saved",
+      "denominator": "views",
+      "guardrails": ["shares", "negative_feedback"],
+      "business_outcome_source": "not_available",
+      "cadence": [
+        {"window": "24h", "label": "provisional"},
+        {"window": "72h", "label": "operational"},
+        {"window": "7d", "label": "cohort"},
+        {"window": "28d", "label": "portfolio"}
+      ]
+    },
+    "data_mode": "unknown",
+    "benchmark_scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand",
+      "account": "account-placeholder",
+      "content_pillar": "education: process preparation",
+      "format": "carousel",
+      "window": null
+    },
+    "window": null,
+    "captured_at": null,
+    "metrics": {},
+    "child_metrics": null,
+    "sample_size": null,
+    "sample_interpretation": "not_available",
+    "story_fetched_at": null,
+    "connector": null
+  }
+}

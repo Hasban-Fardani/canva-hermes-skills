@@ -1,0 +1,7 @@
+interface:
+  display_name: "Brand Copy Studio"
+  short_description: "Capture scoped brand evidence and templates locally"
+  default_prompt: "Use $brand-copy-studio for authorized brand capture/refresh or a bounded public-source observation draft, scoped by tenant/client/brand."
+
+policy:
+  allow_implicit_invocation: true

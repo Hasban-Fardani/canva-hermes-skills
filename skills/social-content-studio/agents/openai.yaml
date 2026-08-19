@@ -1,0 +1,4 @@
+interface:
+  display_name: "Social Content Studio"
+  short_description: "Create governed, Canva-ready social content"
+  default_prompt: "Use $social-content-studio to create a validated, on-brand social content package."
