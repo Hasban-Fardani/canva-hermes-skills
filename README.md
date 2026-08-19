@@ -11,6 +11,40 @@ The package contains only generic skill instructions, templates, examples,
 references, deterministic scripts, and tests. It contains no client material,
 credentials, generated campaign content, export receipts, or runtime state.
 
+## Cara kerja
+
+Alur utama memisahkan penyusunan aturan brand, produksi konten, persetujuan,
+dan publikasi opsional:
+
+```mermaid
+flowchart LR
+  A[Brief + scope] --> B[Brand copy<br/>capture + validate]
+  B --> C[Validated Brand Bundle]
+  C --> D[Objective + pillar<br/>copy + content spec + QA]
+  D --> E[Canva via MCP<br/>capability · template · folder<br/>draft · preview]
+  E --> F{Approve?}
+  F -- Revisi --> D
+  F -- Setuju --> G[Export + download<br/>checksum + receipt]
+  G --> H{Publish?}
+  H -- Tidak --> I[Handoff selesai]
+  H -- Ya --> J[Separate publishing<br/>branch + scoped policy]
+```
+
+Repositori ini adalah lapisan instruksi dan validasi; data runtime tetap berada
+di luar repositori. Persetujuan berjalan approval-first secara default, sedangkan
+mode unattended hanya boleh aktif bila cakupan policy mengizinkannya.
+
+Isolasi data berlaku per klien dan tetap terpisah dari aturan generik di repo:
+
+```mermaid
+flowchart LR
+  R[GitHub repo<br/>generic skills + rules] --> H[Hermes runtime]
+  H --> A[Runtime Klien A]
+  H --> B[Runtime Klien B]
+  H -. OAuth/MCP .-> C[Canva Enterprise]
+  A -. "data Klien A tidak dibagi" .-> B
+```
+
 ## Prerequisites
 
 - Python 3.10 or newer (the bundled tests use only the standard library).
