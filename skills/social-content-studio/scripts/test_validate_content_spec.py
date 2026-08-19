@@ -18,7 +18,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from validate_content_spec import _anti_slop_package_checksum, _load_brand_bundle_validator, calculate_package_checksum, load_trusted_policy, main, validate_content_spec  # noqa: E402
+from validate_content_spec import _anti_slop_package_checksum, _id_profile_digest, _visible_copy_digest, _load_brand_bundle_validator, calculate_package_checksum, load_trusted_policy, main, validate_content_spec  # noqa: E402
 
 
 TEST_EXPORT_DIR = tempfile.TemporaryDirectory(prefix="social-content-validator-")
@@ -387,6 +387,28 @@ def make_approved_spec() -> dict:
         "message_jobs": {"headline": "Name the document.", "body": "Close the unrelated tabs.", "caption": "Use this after a task switch.", "cta_behavior": "Save for the next task switch."},
     }
     spec["copy_quality_audit"] = {"status": "pass", "reason_codes": [], "findings": []}
+    spec["id_style_profile"] = {
+        "register": "neutral_editorial",
+        "channel": "carousel",
+        "audience_relation": "customer",
+        "region_or_community": "national",
+        "pronoun_policy": {"allowed": ["Anda"]},
+        "particle_policy": {},
+        "code_switch_policy": {"allowed_terms": [], "reasons": {}},
+        "scope": full_scope(spec),
+    }
+    spec["copy_quality_audit"]["indonesian_review"] = {
+        "status": "fallback",
+        "method": "neutral_editorial_fallback",
+        "reason": "Fixture uses neutral editorial Indonesian and has no approved colloquial audience profile.",
+        "scope": full_scope(spec),
+        "profile_checksum": _id_profile_digest(spec["id_style_profile"]),
+        "reviewed_copy_digest": _visible_copy_digest(spec),
+        "reviewed_at": "2026-08-19T11:00:00+07:00",
+    }
+    for slide in spec["slides"]:
+        slide["information_job"] = f"Fixture information job for slide {slide['slide']}"
+        slide["progression"] = f"Advances the fixture sequence to slide {slide['slide']}."
     audit["status"] = "pass"
     audit["evidence"] = {
         "ocr": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "exact_match": True},
@@ -426,6 +448,129 @@ def make_approved_spec() -> dict:
 
 class ValidatorTests(unittest.TestCase):
     TODAY = date(2026, 8, 19)
+
+    def id_copy_spec(self, text: str) -> dict:
+        spec = load_json("content-spec.example.json")
+        spec["single_message"] = text
+        spec["slides"][0]["headline"] = text
+        spec["caption"] = {"hook": text, "body": "", "cta": "", "hashtags": []}
+        return spec
+
+    def test_indonesian_stiff_findings_have_reason_codes_and_evidence_spans(self) -> None:
+        spec = self.id_copy_spec("Kami mengecek pesanan Anda. Kami mengemasnya. Kami mengirimkannya sore ini. Open dashboard untuk melihat statusnya.")
+        spec["id_style_profile"] = {
+            "register": "neutral_editorial",
+            "channel": "carousel",
+            "audience_relation": "customer",
+            "region_or_community": "national",
+            "pronoun_policy": {"allowed": ["Anda"]},
+            "particle_policy": {},
+            "code_switch_policy": {"allowed_terms": ["tab"], "reasons": {"tab": "UI label"}},
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        codes = {issue.code for issue in report.warnings}
+        self.assertIn("id_explicit_subject_repeat", codes)
+        self.assertIn("id_unexplained_code_switch", codes)
+        evidence = [issue.evidence_span for issue in report.warnings if issue.code == "id_explicit_subject_repeat"]
+        self.assertTrue(evidence and evidence[0]["text"] and evidence[0]["path"])
+
+    def test_repeated_subject_evidence_spans_point_to_second_and_third_subject(self) -> None:
+        spec = self.id_copy_spec("Kami mengecek pesanan. Kami mengemasnya. Kami mengirimkannya.")
+        spec["id_style_profile"] = {
+            "register": "neutral_editorial", "channel": "carousel", "audience_relation": "customer",
+            "region_or_community": "national", "pronoun_policy": {"allowed": ["Kami"]},
+            "particle_policy": {}, "code_switch_policy": {"allowed_terms": []},
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        spans = [
+            issue.evidence_span
+            for issue in report.warnings
+            if issue.code == "id_explicit_subject_repeat"
+            and issue.evidence_span["path"] == "$.slides[0].headline"
+        ]
+        self.assertEqual(["Kami", "Kami"], [span["text"] for span in spans])
+        self.assertEqual(sorted(span["start"] for span in spans), [span["start"] for span in spans])
+        for span in spans:
+            field_text = spec["slides"][0]["headline"]
+            self.assertEqual(field_text[span["start"]:span["end"]], span["text"])
+
+    def test_production_embedded_style_source_must_resolve_tagged_scoped_evidence(self) -> None:
+        spec = self.id_copy_spec("Yuk, cek dokumen ini!")
+        spec["state"] = "DESIGN_DRAFT"
+        spec["design"]["draft_ref"] = "local:fixture-draft"
+        spec["id_style_profile"] = {
+            "register": "friendly_conversational", "channel": "carousel", "audience_relation": "customer",
+            "region_or_community": "national", "source_ids": ["fake-style-source"],
+            "pronoun_policy": {"allowed": ["kamu"]}, "particle_policy": {"allowed": []},
+            "code_switch_policy": {"allowed_terms": []},
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("id_style_profile_source_unresolved", {issue.code for issue in report.errors})
+
+    def test_colloquial_indonesian_requires_explicit_style_profile(self) -> None:
+        spec = self.id_copy_spec("Yuk, cek promo ini bareng bestie!")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("id_style_profile_required", {issue.code for issue in report.errors})
+
+    def test_approved_particle_provenance_does_not_force_particles_or_slang(self) -> None:
+        spec = self.id_copy_spec("Yuk, cek dokumen ini di aplikasi.")
+        spec["id_style_profile"] = {
+            "register": "friendly_conversational",
+            "channel": "carousel",
+            "audience_relation": "customer",
+            "region_or_community": "national",
+            "pronoun_policy": {"allowed": ["kamu"]},
+            "particle_policy": {
+                "allowed": [{"form": "yuk", "function": "invitation", "speech_act": "invitation", "approved_examples": ["Yuk, cek dokumen ini."]}]
+            },
+            "code_switch_policy": {"allowed_terms": ["aplikasi"], "reasons": {"aplikasi": "ordinary Indonesian"}},
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertNotIn("id_style_profile_required", {issue.code for issue in report.errors})
+        self.assertNotIn("id_particle_without_provenance", {issue.code for issue in report.warnings})
+
+    def test_recoverable_indonesian_fragments_and_ellipsis_are_not_banned(self) -> None:
+        spec = self.id_copy_spec("Terlalu banyak tab. Satu pekerjaan belum mulai…")
+        spec["eyd_review"] = {"standard": "EYD V", "status": "pass", "findings": []}
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        id_codes = {issue.code for issue in report.issues if issue.code.startswith("id_")}
+        self.assertEqual(set(), id_codes)
+
+    def test_production_copy_audit_requires_review_or_neutral_fallback_and_slide_progression(self) -> None:
+        spec = make_approved_spec()
+        spec["copy_quality_audit"].pop("indonesian_review")
+        spec["slides"][0].pop("information_job")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("id_copy_review_required", codes)
+        self.assertIn("slide_information_job_missing", codes)
+
+    def test_malformed_copy_reason_code_is_reported_without_crashing(self) -> None:
+        spec = self.id_copy_spec("Kami menyediakan panduan.")
+        spec["state"] = "BRAND_QA"
+        spec["human_copy_brief"] = {"proof": {"source_refs": ["proof-organise"]}}
+        spec["copy_quality_audit"] = {"status": "pass", "reason_codes": [{"bad": "shape"}], "findings": []}
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("copy_quality_reason_codes", {issue.code for issue in report.errors})
+
+    def test_nominalization_suffix_false_positives_remain_clean(self) -> None:
+        spec = self.id_copy_spec("Pelanggan membuka langkahnya dan memeriksa sumbernya.")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertNotIn("id_abstract_nominalization_cluster", {issue.code for issue in report.warnings})
+
+    def test_code_switch_policy_accepts_term_objects_and_checksum_binds_copy_audit(self) -> None:
+        spec = self.id_copy_spec("Buka Settings lalu pilih Save di dashboard.")
+        spec["id_style_profile"] = {
+            "register": "friendly_conversational", "channel": "carousel", "audience_relation": "customer",
+            "region_or_community": "national", "source_ids": ["fixture-style"], "pronoun_policy": {"allowed": ["kamu"]},
+            "particle_policy": {}, "code_switch_policy": {"allowed_terms": [{"term": "Settings", "reason": "UI label"}, {"term": "Save", "reason": "UI label"}, {"term": "dashboard", "reason": "UI label"}]},
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertNotIn("id_unexplained_code_switch", {issue.code for issue in report.warnings})
+        approved = make_approved_spec()
+        before = calculate_package_checksum(approved)
+        approved["copy_quality_audit"]["findings"] = [{"reason_code": "id_register_jump", "evidence_span": {"path": "$.slides[0].headline", "text": "fixture", "start": 0, "end": 7}}]
+        self.assertNotEqual(before, calculate_package_checksum(approved))
 
     def test_privileged_external_policy_requires_each_actor_metadata_field(self) -> None:
         for field in ("actor_id", "actor_role", "identity_source"):
@@ -485,7 +630,7 @@ class ValidatorTests(unittest.TestCase):
 
     def test_approval_checksum_matches_independent_golden_literal(self) -> None:
         spec = make_approved_spec()
-        self.assertEqual("sha256:fdaca8c011cf5f168a17e90d6994546683d3a8480381f554805c555a0c3d17cb", calculate_package_checksum(spec))
+        self.assertEqual("sha256:568aaccf8467f7bf7d1084f615fb32a993f1ead58d689c3f09a3d794f8f0d671", calculate_package_checksum(spec))
 
     def test_early_example_passes_with_approved_brand(self) -> None:
         spec = load_json("content-spec.example.json")

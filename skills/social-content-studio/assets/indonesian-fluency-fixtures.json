@@ -1,0 +1,18 @@
+{
+  "stiff_nominalization": {
+    "text": "Melalui peningkatan kualitas layanan, kami menghadirkan kemudahan penggunaan.",
+    "expected_reason_codes": ["id_abstract_nominalization_cluster", "id_calque_or_translation_residue"]
+  },
+  "stiff_repetition_and_switch": {
+    "text": "Kami mengecek pesanan Anda. Kami mengemasnya. Kami mengirimkannya sore ini. Open dashboard untuk melihat statusnya.",
+    "expected_reason_codes": ["id_explicit_subject_repeat", "id_unexplained_code_switch"]
+  },
+  "natural_recoverable_fragment": {
+    "text": "Terlalu banyak tab. Satu pekerjaan belum mulai. Pilih dokumen yang akan dikerjakan, lalu tutup yang tidak terkait.",
+    "expected_reason_codes": []
+  },
+  "natural_concrete_false_positive": {
+    "text": "Rapat selesai. Tab-nya masih terbuka. Pilih dokumen keputusan itu; tautan lain menunggu.",
+    "expected_reason_codes": []
+  }
+}

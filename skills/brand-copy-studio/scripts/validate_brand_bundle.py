@@ -135,6 +135,130 @@ ANTI_SLOP_POLICY_ALIASES = {
     "prohibited": ("prohibited", "prohibited_uses", "prohibited_roles", "prohibited_ai_roles"),
 }
 
+# ``id_style_profile`` is additive: legacy bundles may omit it entirely.  The
+# aliases keep handoffs produced by earlier drafts readable without making a
+# second canonical representation.  Values are intentionally a small register
+# vocabulary; this is a configuration gate, not a language or naturalness
+# score.
+STYLE_PROFILE_ALIASES = ("id_style_profile", "indonesian_style_profile", "locale_style_profile")
+STYLE_PROFILE_FIELD_ALIASES = {
+    "channel": ("channel", "channels"),
+    "register": ("register", "style_register"),
+    "audience_relation": ("audience_relation", "relationship"),
+    "region_or_community": ("region_or_community", "region_community", "region"),
+    "pronoun_policy": ("pronoun_policy", "pronoun_address_policy"),
+    "particle_policy": ("particle_policy", "particles"),
+    "code_switch_policy": ("code_switch_policy", "code_switching_policy"),
+    "contraction_spelling_policy": ("contraction_spelling_policy", "spelling_policy"),
+    "approved_human_examples": ("approved_human_examples", "human_examples"),
+}
+STYLE_PROFILE_REQUIRED_FIELDS = tuple(STYLE_PROFILE_FIELD_ALIASES)
+STYLE_PROFILE_REGISTERS = {
+    "formal_public",
+    "neutral_editorial",
+    "friendly_conversational",
+    "community_specific",
+    "fandom",
+    "local_activation",
+    "youth_community",
+    # Compatibility labels seen in handoff notes.
+    "formal",
+    "colloquial",
+    "community",
+    "friendly-national",
+    "youth-community",
+}
+STYLE_PROFILE_COLLOQUIAL_REGISTERS = {
+    "friendly_conversational",
+    "community_specific",
+    "fandom",
+    "local_activation",
+    "youth_community",
+    "colloquial",
+    "community",
+    "friendly-national",
+    "youth-community",
+}
+STYLE_PROFILE_CHANNELS = {
+    "policy",
+    "website",
+    "carousel",
+    "caption",
+    "comment",
+    "chat",
+    "spoken_script",
+    "social_post",
+    "landing_page",
+    "email",
+    "support",
+}
+STYLE_PROFILE_RELATIONS = {
+    "stranger",
+    "customer",
+    "peer",
+    "member",
+    "authority",
+    "mixed",
+    "community",
+}
+STYLE_PROFILE_POLICY_KEYS = {
+    "pronoun_policy": {
+        "approved",
+        "approved_forms",
+        "approved_pronouns",
+        "avoid",
+        "prohibited",
+        "disallowed",
+        "address_terms",
+        "notes",
+        "assumptions",
+        "evidence_status",
+        "source_ids",
+    },
+    "particle_policy": {
+        "approved",
+        "allowed",
+        "particles",
+        "prohibited",
+        "forbidden",
+        "avoid",
+        "no_forced_slang",
+        "max_per_sentence",
+        "review_rule",
+        "notes",
+        "evidence_status",
+        "source_ids",
+    },
+    "code_switch_policy": {
+        "allowed_terms",
+        "approved_terms",
+        "allowed",
+        "do_not_translate",
+        "do_not_translate_terms",
+        "translate_surrounding_syntax",
+        "translate_unlisted_terms",
+        "reasons",
+        "notes",
+        "evidence_status",
+        "source_ids",
+    },
+    "contraction_spelling_policy": {
+        "approved_forms",
+        "contractions",
+        "approved",
+        "standard_forms",
+        "standard",
+        "prohibited_forms",
+        "do_not_use",
+        "default_spelling",
+        "rules",
+        "eyd_kbbi",
+        "notes",
+        "evidence_status",
+        "source_ids",
+    },
+}
+
 
 def _path(path: str | Path) -> Path:
     return Path(path).expanduser()
@@ -589,6 +713,340 @@ def _validate_anti_slop_contract(
         _validate_feedback_reason_codes(feedback, "brand-profile.json.feedback_reason_codes", expected_scope, privileged, errors)
 
     return source_refs
+
+
+def _style_profile_fields(profile: dict[str, Any], errors: list[str]) -> dict[str, Any] | None:
+    """Return one additive Indonesian style profile, accepting compatibility aliases."""
+
+    present = [(name, profile.get(name)) for name in STYLE_PROFILE_ALIASES if name in profile]
+    present = [(name, value) for name, value in present if value is not None]
+    if not present:
+        return None
+    canonical_name, canonical = present[0]
+    if not isinstance(canonical, dict):
+        errors.append(f"brand-profile.json.{canonical_name}: must be an object")
+        return None
+    for alias, value in present[1:]:
+        if not isinstance(value, dict):
+            errors.append(f"brand-profile.json.{alias}: must be an object")
+        elif value != canonical:
+            errors.append(f"brand-profile.json.{canonical_name}: conflicts with brand-profile.json.{alias}")
+    return canonical
+
+
+def _style_profile_value(profile: dict[str, Any], field: str) -> tuple[Any, str | None]:
+    """Get a profile field and its actual key, allowing descriptive aliases."""
+
+    for alias in STYLE_PROFILE_FIELD_ALIASES[field]:
+        if alias in profile:
+            return profile[alias], alias
+    return None, None
+
+
+def _style_profile_scalar(value: Any) -> Any:
+    """Accept an evidence-wrapped scalar while keeping the compact form canonical."""
+
+    if isinstance(value, dict) and "value" in value:
+        return value.get("value")
+    return value
+
+
+def _style_profile_strings(value: Any, location: str, errors: list[str], required: bool = False) -> list[str]:
+    """Validate a scalar-or-string-list style setting and return its values."""
+
+    value = _style_profile_scalar(value)
+    if isinstance(value, str):
+        if not value.strip():
+            if required:
+                errors.append(f"{location}: must be a non-empty string or array")
+            return []
+        return [value]
+    if not isinstance(value, list):
+        errors.append(f"{location}: must be a string or array of strings")
+        return []
+    result: list[str] = []
+    for index, item in enumerate(value):
+        if not _is_nonempty_string(item):
+            errors.append(f"{location}[{index}]: must be a non-empty string")
+        else:
+            result.append(item)
+    if required and not result:
+        errors.append(f"{location}: must not be empty")
+    return result
+
+
+def _style_policy_evidence(
+    value: Any,
+    location: str,
+    privileged: bool,
+    errors: list[str],
+    required: bool = False,
+) -> list[str]:
+    """Validate evidence metadata attached to a style policy."""
+
+    if not isinstance(value, dict):
+        if required:
+            errors.append(f"{location}: must be an object")
+        return []
+    if required:
+        _require_fields(value, ("evidence_status", "source_ids"), location, errors)
+    if "evidence_status" in value:
+        status = value.get("evidence_status")
+        if status not in ALLOWED_EVIDENCE:
+            errors.append(f"{location}.evidence_status: invalid value {status!r}")
+        elif privileged and status not in APPROVED_EVIDENCE:
+            errors.append(f"{location}: privileged style evidence requires exact or observed status")
+    refs: list[str] = []
+    if "source_ids" in value:
+        refs = _validate_string_list(value.get("source_ids"), f"{location}.source_ids", errors)
+        if privileged and not refs:
+            errors.append(f"{location}: privileged style evidence requires non-empty source_ids")
+    return refs
+
+
+def _style_record_evidence(
+    value: dict[str, Any],
+    location: str,
+    privileged: bool,
+    errors: list[str],
+    require_text: bool = False,
+) -> list[str]:
+    """Validate a nested style record's evidence and optional example text."""
+
+    if require_text and not any(_is_nonempty_string(value.get(key)) for key in ("example", "text", "value", "description")):
+        errors.append(f"{location}: requires a non-empty example")
+    refs = _style_policy_evidence(value, location, privileged, errors, required=privileged)
+    return refs
+
+
+def _validate_style_profile(
+    style: dict[str, Any] | None,
+    location: str,
+    privileged: bool,
+    colloquial: bool,
+    errors: list[str],
+) -> list[tuple[str, list[str]]]:
+    """Validate the additive Indonesian register profile.
+
+    Draft profiles are intentionally allowed to be incomplete.  Once a profile
+    participates in an active/approved state, every register decision is
+    explicit and evidence-backed; colloquial/community profiles additionally
+    require the anti-cosmetic particle and example safeguards.
+    """
+
+    if style is None:
+        return []
+    source_refs: list[tuple[str, list[str]]] = []
+    allowed_fields = {
+        *STYLE_PROFILE_REQUIRED_FIELDS,
+        "evidence_status",
+        "source_ids",
+        "notes",
+        "no_forced_slang",
+        "style_register",
+        "region_community",
+        "pronoun_address_policy",
+        "code_switching_policy",
+        "spelling_policy",
+        "human_examples",
+        "register_basis",
+    }
+    unknown = sorted(set(style) - allowed_fields)
+    if unknown:
+        errors.append(f"{location}: unknown field(s) {unknown!r}")
+
+    profile_refs = _style_policy_evidence(style, location, privileged, errors, required=privileged)
+    if "evidence_status" in style or "source_ids" in style:
+        source_refs.append((location, profile_refs))
+
+    values: dict[str, Any] = {}
+    for field in STYLE_PROFILE_REQUIRED_FIELDS:
+        value, actual_key = _style_profile_value(style, field)
+        if actual_key is None:
+            if privileged:
+                errors.append(f"{location}.{field}: required for privileged style output")
+            continue
+        field_location = f"{location}.{actual_key}"
+        values[field] = value
+        if field in {"channel", "register", "audience_relation", "region_or_community"}:
+            required_value = privileged
+            strings = _style_profile_strings(value, field_location, errors, required=required_value)
+            if field == "channel":
+                unknown_channels = sorted(set(strings) - STYLE_PROFILE_CHANNELS)
+                if unknown_channels:
+                    errors.append(f"{field_location}: unsupported channel(s) {unknown_channels!r}")
+            elif field == "register":
+                unknown_registers = sorted(set(strings) - STYLE_PROFILE_REGISTERS)
+                if unknown_registers:
+                    errors.append(f"{field_location}: unsupported register(s) {unknown_registers!r}")
+            elif field == "audience_relation":
+                unknown_relations = sorted(set(strings) - STYLE_PROFILE_RELATIONS)
+                if unknown_relations:
+                    errors.append(f"{field_location}: unsupported audience relation(s) {unknown_relations!r}")
+            continue
+        if field == "approved_human_examples":
+            if not isinstance(value, list):
+                errors.append(f"{field_location}: must be an array")
+                continue
+            if privileged and not value:
+                errors.append(f"{field_location}: must not be empty for privileged style output")
+            for index, example in enumerate(value):
+                example_location = f"{field_location}[{index}]"
+                if not isinstance(example, dict):
+                    errors.append(f"{example_location}: must be an object")
+                    continue
+                if privileged and not _is_nonempty_string(example.get("id")):
+                    errors.append(f"{example_location}.id: must be a non-empty string")
+                refs = _style_record_evidence(example, example_location, privileged, errors, require_text=True)
+                if privileged:
+                    for key in ("channel", "register", "audience_relation", "region_or_community"):
+                        if not _is_nonempty_string(example.get(key)):
+                            errors.append(f"{example_location}.{key}: required for privileged human example")
+                source_refs.append((example_location, refs))
+            continue
+        policy = value
+        policy_location = field_location
+        if not isinstance(policy, dict):
+            errors.append(f"{policy_location}: must be an object")
+            continue
+        unknown_policy_fields = sorted(set(policy) - STYLE_PROFILE_POLICY_KEYS.get(field, set()))
+        if unknown_policy_fields:
+            errors.append(f"{policy_location}: unknown field(s) {unknown_policy_fields!r}")
+        refs = _style_policy_evidence(policy, policy_location, privileged, errors, required=privileged)
+        source_refs.append((policy_location, refs))
+
+        if field == "pronoun_policy":
+            approved = next((policy[key] for key in ("approved", "approved_forms", "approved_pronouns") if key in policy), None)
+            avoid = next((policy[key] for key in ("avoid", "prohibited", "disallowed") if key in policy), None)
+            if privileged:
+                _style_profile_strings(approved, f"{policy_location}.approved", errors, required=colloquial)
+                _style_profile_strings(avoid, f"{policy_location}.avoid", errors, required=False)
+        elif field == "particle_policy":
+            particles = next((policy[key] for key in ("approved", "allowed", "particles") if key in policy), None)
+            if not isinstance(particles, list):
+                errors.append(f"{policy_location}.approved: must be an array")
+                particles = []
+            no_forced_slang = policy.get("no_forced_slang")
+            if privileged and no_forced_slang is not True:
+                errors.append(f"{policy_location}.no_forced_slang: must be true for privileged style output")
+            for index, particle in enumerate(particles):
+                particle_location = f"{policy_location}.approved[{index}]"
+                if isinstance(particle, str):
+                    if privileged:
+                        errors.append(f"{particle_location}: must be an object with speech_act, function, and approved_examples")
+                    continue
+                if not isinstance(particle, dict):
+                    errors.append(f"{particle_location}: must be an object")
+                    continue
+                if privileged and not _is_nonempty_string(particle.get("particle")):
+                    errors.append(f"{particle_location}.particle: must be a non-empty string")
+                speech_acts = particle.get("speech_acts", particle.get("speech_act"))
+                if privileged and not _style_profile_strings(speech_acts, f"{particle_location}.speech_act", errors, required=True):
+                    pass
+                if privileged and not _is_nonempty_string(particle.get("function")):
+                    errors.append(f"{particle_location}.function: must be a non-empty string")
+                examples = particle.get("approved_examples", particle.get("examples"))
+                if not isinstance(examples, list) or not examples:
+                    if privileged:
+                        errors.append(f"{particle_location}.approved_examples: must be a non-empty array")
+                refs = _style_record_evidence(particle, particle_location, privileged, errors)
+                source_refs.append((particle_location, refs))
+                if isinstance(examples, list):
+                    for example_index, example in enumerate(examples):
+                        if not _is_nonempty_string(example) and not isinstance(example, dict):
+                            errors.append(f"{particle_location}.approved_examples[{example_index}]: must be text or object")
+            continue
+        if field == "code_switch_policy":
+            allowed_terms = policy.get("allowed_terms", policy.get("approved_terms", policy.get("allowed")))
+            do_not_translate = policy.get("do_not_translate", policy.get("do_not_translate_terms"))
+            if not isinstance(allowed_terms, list):
+                errors.append(f"{policy_location}.allowed_terms: must be an array")
+            if not isinstance(do_not_translate, list):
+                errors.append(f"{policy_location}.do_not_translate: must be an array")
+            if privileged:
+                for key, items in (("allowed_terms", allowed_terms), ("do_not_translate", do_not_translate)):
+                    if isinstance(items, list) and not items:
+                        # An empty list is explicit: no approved switch/term.
+                        continue
+                    if isinstance(items, list):
+                        for index, item in enumerate(items):
+                            item_location = f"{policy_location}.{key}[{index}]"
+                            if isinstance(item, str):
+                                errors.append(f"{item_location}: must be an evidence-backed object with a reason")
+                            elif not isinstance(item, dict):
+                                errors.append(f"{item_location}: must be an object")
+                            elif not _is_nonempty_string(item.get("term")):
+                                errors.append(f"{item_location}.term: must be a non-empty string")
+                            elif not _is_nonempty_string(item.get("reason")):
+                                errors.append(f"{item_location}.reason: must be a non-empty string")
+                            elif isinstance(item, dict):
+                                item_refs = _style_record_evidence(item, item_location, privileged, errors)
+                                source_refs.append((item_location, item_refs))
+                if not isinstance(policy.get("translate_surrounding_syntax"), bool):
+                    errors.append(f"{policy_location}.translate_surrounding_syntax: must be boolean")
+            continue
+        if field == "contraction_spelling_policy":
+            for key in ("approved_forms", "contractions", "approved", "standard_forms", "standard", "prohibited_forms", "do_not_use", "rules"):
+                if key in policy and not isinstance(policy[key], list):
+                    errors.append(f"{policy_location}.{key}: must be an array")
+            if privileged and not any(key in policy for key in ("default_spelling", "rules", "approved_forms", "standard_forms", "standard")):
+                errors.append(f"{policy_location}: requires an explicit default_spelling or spelling rules")
+            if privileged and "default_spelling" in policy and not _is_nonempty_string(policy.get("default_spelling")):
+                errors.append(f"{policy_location}.default_spelling: must be a non-empty string")
+
+    if privileged and colloquial:
+        # A colloquial profile must prove the relationship it is asking the
+        # model to perform; a particle list alone is never enough.
+        approved_pronouns = values.get("pronoun_policy")
+        if isinstance(approved_pronouns, dict):
+            forms = approved_pronouns.get("approved", approved_pronouns.get("approved_forms"))
+            if not _style_profile_strings(forms, f"{location}.pronoun_policy.approved", errors, required=True):
+                pass
+    return source_refs
+
+
+def _style_profile_is_colloquial(style: dict[str, Any] | None) -> bool:
+    """Return whether a declared profile needs community/colloquial safeguards."""
+
+    if not isinstance(style, dict):
+        return False
+    register, _ = _style_profile_value(style, "register")
+    registers = _style_profile_strings(register, "brand-profile.json.id_style_profile.register", [], required=False)
+    return bool(set(registers) & STYLE_PROFILE_COLLOQUIAL_REGISTERS)
+
+
+def _style_profile_observation_records(style: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Flatten nested style records so observe mode cannot promote exact data."""
+
+    records: list[tuple[str, dict[str, Any]]] = [("brand-profile.json.id_style_profile", style)]
+    for field in STYLE_PROFILE_REQUIRED_FIELDS:
+        value, actual_key = _style_profile_value(style, field)
+        if not isinstance(value, dict) or actual_key is None:
+            continue
+        policy_location = f"brand-profile.json.id_style_profile.{actual_key}"
+        records.append((policy_location, value))
+        if field == "particle_policy":
+            particles = next((value[key] for key in ("approved", "allowed", "particles") if key in value), [])
+            if isinstance(particles, list):
+                for index, particle in enumerate(particles):
+                    if isinstance(particle, dict):
+                        records.append((f"{policy_location}.approved[{index}]", particle))
+        elif field == "code_switch_policy":
+            for key in ("allowed_terms", "approved_terms", "allowed", "do_not_translate", "do_not_translate_terms"):
+                terms = value.get(key)
+                if isinstance(terms, list):
+                    records.extend(
+                        (f"{policy_location}.{key}[{index}]", term)
+                        for index, term in enumerate(terms)
+                        if isinstance(term, dict)
+                    )
+        elif field == "approved_human_examples" and isinstance(value, list):
+            records.extend(
+                (f"{policy_location}[{index}]", example)
+                for index, example in enumerate(value)
+                if isinstance(example, dict)
+            )
+    return records
 
 
 def _load_json(path: Path, errors: list[str]) -> dict[str, Any] | None:
@@ -1137,6 +1595,26 @@ def validate_brand_bundle(
             errors,
         )
     )
+    style_profile = _style_profile_fields(profile, errors)
+    style_profile_colloquial = _style_profile_is_colloquial(style_profile)
+    # A declared profile in an active/approved bundle is privileged even when
+    # its register is incomplete.  Treat an unknown register as unsafe rather
+    # than silently emitting community-specific language.
+    style_profile_privileged = needs_privileged_authority and style_profile is not None
+    if style_profile_privileged and not style_profile_colloquial:
+        register_value, _ = _style_profile_value(style_profile or {}, "register")
+        register_values = _style_profile_strings(register_value, "brand-profile.json.id_style_profile.register", [], required=False)
+        if not register_values or not (set(register_values) & STYLE_PROFILE_REGISTERS):
+            style_profile_colloquial = True
+    profile_source_refs.extend(
+        _validate_style_profile(
+            style_profile,
+            "brand-profile.json.id_style_profile",
+            style_profile_privileged,
+            style_profile_colloquial,
+            errors,
+        )
+    )
     claim_source_refs = [(f"claim-registry.json.claims[{index}]", _validate_string_list(record.get("source_ids"), f"claim-registry.json.claims[{index}].source_ids", errors)) for index, record in enumerate(claims) if isinstance(record, dict)]
     template_source_refs = [(f"template-registry.json.templates[{index}]", _validate_string_list(record.get("source_ids"), f"template-registry.json.templates[{index}].source_ids", errors)) for index, record in enumerate(templates) if isinstance(record, dict)]
     for location, refs in profile_source_refs + claim_source_refs + template_source_refs:
@@ -1219,6 +1697,8 @@ def validate_brand_bundle(
             record = anti_slop_fields.get(field)
             if isinstance(record, dict):
                 observed_records.append((f"brand-profile.json.{field}", record))
+        if isinstance(style_profile, dict):
+            observed_records.extend(_style_profile_observation_records(style_profile))
         for location, record in observed_records:
             if record.get("evidence_status") == "exact":
                 errors.append(f"{location}: observe operation requires observed, inferred, or unverified evidence")

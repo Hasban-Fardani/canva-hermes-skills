@@ -89,6 +89,89 @@ COPY_QUALITY_REASON_CODES = {
     "GENERIC_MOTIVATIONAL_CLOSURE", "DECORATIVE_SAVE_CTA", "PARAPHRASE_NO_PROGRESS",
     "INTERCHANGEABLE_BRAND_COPY", "UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM",
 }
+# Indonesian register findings are editorial warnings, not authorship labels or
+# EYD failures.  Keep the codes stable so a native/pairwise review can refer to
+# the same observable span across revisions.
+INDONESIAN_REASON_CODES = {
+    "id_explicit_subject_repeat",
+    "id_identical_sentence_frame",
+    "id_abstract_nominalization_cluster",
+    "id_particle_without_provenance",
+    "id_unexplained_code_switch",
+    "id_calque_or_translation_residue",
+    "id_register_jump",
+}
+COPY_QUALITY_REASON_CODES |= INDONESIAN_REASON_CODES
+INDONESIAN_REGISTERS = {
+    "formal_public",
+    "neutral_editorial",
+    "friendly_conversational",
+    "community_specific",
+    "colloquial",
+    "youth_community",
+    "fandom",
+    "local_activation",
+}
+INDONESIAN_COLLOQUIAL_REGISTERS = {
+    "friendly_conversational",
+    "community_specific",
+    "colloquial",
+    "youth_community",
+    "fandom",
+    "local_activation",
+}
+INDONESIAN_PARTICLES = {
+    "yuk", "ayo", "nih", "lho", "kok", "sih", "kan", "deh", "dong", "aja", "ya",
+}
+INDONESIAN_COLLOQUIAL_MARKERS = {
+    "kamu", "gue", "gua", "lu", "lo", "nggak", "gak", "ga", "udah", "pengen", "pake",
+    "sampe", "aja", "yuk", "ayo", "nih", "lho", "kok", "sih", "deh", "dong", "bestie",
+    "cobain", "gas", "boncos", "bareng", "banget", "pantengin", "cuss", "kalap",
+}
+INDONESIAN_FORMAL_MARKERS = {
+    "anda", "dapat", "mohon", "dimohon", "berdasarkan", "sehubungan", "pelanggan", "pengguna",
+    "diharapkan", "silakan", "ketentuan", "persyaratan", "penggunaan",
+}
+INDONESIAN_ABSTRACT_NOUNS = {
+    "pengalaman", "kenyamanan", "kemudahan", "solusi", "peningkatan", "kualitas", "penggunaan",
+    "dampak", "layanan", "kebutuhan", "pelaksanaan", "pencapaian", "kesempatan", "keamanan",
+    "kepercayaan", "perjalanan", "pemanfaatan", "pengembangan", "perubahan", "efektivitas",
+    "efisiensi", "kenyamanan", "keberhasilan", "penyediaan", "pengoptimalan",
+}
+INDONESIAN_GENERIC_VERBS = {
+    "menghadirkan", "meningkatkan", "mewujudkan", "mendukung", "memberikan", "menciptakan",
+    "menawarkan", "memastikan", "mengoptimalkan", "memfasilitasi", "menghadirkanlah",
+}
+INDONESIAN_CONCRETE_WORDS = {
+    "tab", "dokumen", "tautan", "pesanan", "sumber", "catatan", "rapat", "kulkas", "menu",
+    "parkir", "bandara", "antrean", "file", "berkas", "alamat", "angka", "jam", "lokasi",
+    "produk", "aplikasi", "formulir", "tombol", "pesan", "langkah", "keputusan", "pekerjaan",
+}
+INDONESIAN_ACTION_VERBS = {
+    "cek", "buka", "tutup", "pilih", "pesan", "kirim", "baca", "mulai", "simpan", "tulis",
+    "gunakan", "datang", "makan", "jalan", "ubah", "kurangi", "mengurangi", "mempercepat",
+    "mengecek", "mengemas", "mengirim", "membaca", "membuka", "menutup", "memilih", "menyebut",
+    "menyelesaikan", "pisahkan", "kelompokkan", "bandingkan", "tandai", "daftar", "ajak", "coba",
+}
+INDONESIAN_CODE_SWITCH_PHRASES = (
+    "now or never", "stay tuned", "feel the excitement", "you can", "after that", "finally",
+    "check out", "stopped by", "quality time", "skin journey", "worth it", "discover",
+    "experience", "feel the", "best practice", "settings", "save", "dashboard",
+)
+INDONESIAN_SUBJECTS = {
+    "kami", "kita", "anda", "kamu", "gue", "gua", "lu", "lo", "produk", "produk ini",
+    "layanan", "layanan ini", "tim", "tim kami", "pengguna", "pelanggan",
+}
+INDONESIAN_AUXILIARIES = {"dapat", "bisa", "akan", "sudah", "telah", "perlu", "harus", "boleh"}
+ID_REVIEW_METHODS = {
+    "native_editor",
+    "native_review",
+    "pairwise_native_editor",
+    "pairwise_review",
+    "pairwise",
+    "neutral_editorial_fallback",
+    "neutral-editorial-fallback",
+}
 ANTI_SLOP_REASON_CODE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,63}")
 ANTI_SLOP_SLOP_DIMENSIONS = (
     "generic_language",
@@ -283,17 +366,18 @@ class Issue:
     code: str
     path: str
     message: str
+    evidence_span: dict[str, Any] | None = None
 
 
 class Report:
     def __init__(self) -> None:
         self.issues: list[Issue] = []
 
-    def error(self, code: str, path: str, message: str) -> None:
-        self.issues.append(Issue("error", code, path, message))
+    def error(self, code: str, path: str, message: str, evidence_span: dict[str, Any] | None = None) -> None:
+        self.issues.append(Issue("error", code, path, message, evidence_span))
 
-    def warning(self, code: str, path: str, message: str) -> None:
-        self.issues.append(Issue("warning", code, path, message))
+    def warning(self, code: str, path: str, message: str, evidence_span: dict[str, Any] | None = None) -> None:
+        self.issues.append(Issue("warning", code, path, message, evidence_span))
 
     @property
     def errors(self) -> list[Issue]:
@@ -1292,6 +1376,582 @@ def _all_content_text(spec: dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
+def _indonesian_text_units(spec: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return copy-bearing fields with stable JSON paths for evidence spans."""
+
+    units: list[tuple[str, str]] = []
+    if _nonempty_string(spec.get("single_message")):
+        units.append(("$.single_message", str(spec["single_message"])))
+    slides = spec.get("slides")
+    if isinstance(slides, list):
+        for index, slide in enumerate(slides):
+            if not isinstance(slide, dict):
+                continue
+            for key in ("headline", "body", "cta"):
+                value = slide.get(key)
+                if _nonempty_string(value):
+                    units.append((f"$.slides[{index}].{key}", value))
+    caption = spec.get("caption")
+    if isinstance(caption, dict):
+        for key in ("hook", "body", "cta"):
+            value = caption.get(key)
+            if _nonempty_string(value):
+                units.append((f"$.caption.{key}", value))
+    return units
+
+
+def _indonesian_words(text: str) -> list[re.Match[str]]:
+    return list(re.finditer(r"[\wÀ-ÿ]+(?:[-'][\wÀ-ÿ]+)?", text, flags=re.UNICODE))
+
+
+def _looks_like_indonesian(text: str) -> bool:
+    words = {match.group(0).casefold() for match in _indonesian_words(text)}
+    signals = {
+        "yang", "dan", "dengan", "untuk", "ini", "itu", "kami", "kita", "anda", "kamu",
+        "bisa", "dapat", "sebelum", "setelah", "mulai", "cek", "simpan", "pilih", "buka",
+        "tutup", "layanan", "pengguna", "pelanggan", "sudah", "akan", "dari", "pada",
+    }
+    return bool(words & signals)
+
+
+def _id_style_profile(spec: dict[str, Any]) -> dict[str, Any] | None:
+    profile = spec.get("id_style_profile")
+    if profile is None and isinstance(spec.get("locale_policy"), dict):
+        profile = spec["locale_policy"].get("id_style_profile")
+    return profile if isinstance(profile, dict) else None
+
+
+def _id_register(profile: dict[str, Any] | None) -> str | None:
+    if not isinstance(profile, dict):
+        return None
+    value = profile.get("register", profile.get("mode"))
+    return value if isinstance(value, str) else None
+
+
+def _id_profile_digest(profile: dict[str, Any]) -> str:
+    encoded = json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _id_profile_source_ids(profile: dict[str, Any]) -> list[str]:
+    values = profile.get("source_ids", profile.get("evidence_ids"))
+    if isinstance(values, list):
+        return [value for value in values if isinstance(value, str) and value.strip()]
+    if isinstance(values, str) and values.strip():
+        return [values]
+    evidence = profile.get("evidence")
+    if isinstance(evidence, dict):
+        values = evidence.get("source_ids", evidence.get("ids"))
+        if isinstance(values, list):
+            return [value for value in values if isinstance(value, str) and value.strip()]
+    return []
+
+
+def _id_resolved_style_source_ids(spec: dict[str, Any], expected_scope: dict[str, str] | None) -> set[str]:
+    """Resolve only scoped packet evidence explicitly tagged for style/register."""
+
+    packet = spec.get("source_packet")
+    if not isinstance(packet, dict):
+        return set()
+    expected = _scope_with_brand(expected_scope)
+    records: list[Any] = []
+    for key in ("evidence", "style_evidence", "provenance", "sources"):
+        value = packet.get(key)
+        if isinstance(value, list):
+            records.extend(value)
+    resolved: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        source_id = record.get("source_id", record.get("id", record.get("evidence_id")))
+        if not isinstance(source_id, str) or not source_id.strip():
+            continue
+        tags = record.get("tags", record.get("evidence_tags", record.get("labels", [])))
+        if isinstance(tags, str):
+            tags = [tags]
+        tag_text = {str(tag).casefold() for tag in tags} if isinstance(tags, list) else set()
+        kind = str(record.get("kind", record.get("type", record.get("evidence_type", "")))).casefold()
+        if not any(any(marker in tag for marker in ("style", "register", "locale", "linguistic", "copy_review")) for tag in tag_text) and not any(marker in kind for marker in ("style", "register", "locale", "linguistic")):
+            continue
+        record_scope = record.get("scope", packet.get("scope"))
+        if expected is not None and record_scope != expected:
+            continue
+        resolved.add(source_id)
+    return resolved
+
+
+def _id_authoritative_profile(brand: Any, brand_bundle: dict[str, Any] | None) -> dict[str, Any] | None:
+    for candidate in (
+        brand_bundle.get("profile") if isinstance(brand_bundle, dict) else None,
+        brand if isinstance(brand, dict) else None,
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        profile = candidate.get("id_style_profile")
+        if profile is None and isinstance(candidate.get("locale_policy"), dict):
+            profile = candidate["locale_policy"].get("id_style_profile")
+        if isinstance(profile, dict):
+            return profile
+    return None
+
+
+def _id_is_colloquial_output(text: str, profile: dict[str, Any] | None = None) -> bool:
+    words = {match.group(0).casefold() for match in _indonesian_words(text)}
+    return bool(words & INDONESIAN_COLLOQUIAL_MARKERS) or _id_register(profile) in INDONESIAN_COLLOQUIAL_REGISTERS
+
+
+def _id_is_derivational_nominal(token: str) -> bool:
+    """Recognize productive nominal patterns without treating every -nya as a noun."""
+
+    normalized = token.casefold()
+    if normalized in INDONESIAN_ABSTRACT_NOUNS:
+        return True
+    # Lexicalized abstract heads are explicit above.  For productive forms,
+    # require a nominal prefix and an -an ending; pelanggan, teman, langkahnya,
+    # and sumbernya consequently remain ordinary words.
+    return bool(re.fullmatch(r"(?:peng|pen|pem|peny|per|ke)[a-z]{3,}an", normalized))
+
+
+def _id_policy_terms(policy: Any) -> set[str]:
+    """Extract only explicitly approved terms; never infer a Jakarta default."""
+
+    if isinstance(policy, dict):
+        candidates: Any = policy.get("allowed_terms", policy.get("allowed_forms", policy.get("allowed")))
+        if candidates is None:
+            candidates = policy.get("approved_terms", policy.get("approved"))
+        if isinstance(candidates, dict):
+            return {str(key).casefold() for key in candidates}
+        if isinstance(candidates, list):
+            terms: set[str] = set()
+            for item in candidates:
+                if isinstance(item, str):
+                    terms.add(item.casefold())
+                elif isinstance(item, dict) and isinstance(item.get("term"), str):
+                    terms.add(item["term"].casefold())
+            return terms
+        # A map such as {"tab": {"reason": "UI label"}} is also useful.
+        return {str(key).casefold() for key in policy if isinstance(key, str) and key not in {"reason", "source", "examples"}}
+    if isinstance(policy, list):
+        return {str(item).casefold() for item in policy if isinstance(item, str)}
+    return set()
+
+
+def _id_particle_entries(profile: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(profile, dict):
+        return {}
+    policy = profile.get("particle_policy", profile.get("particles"))
+    if not isinstance(policy, dict):
+        return {}
+    raw = policy.get("allowed", policy.get("approved", policy.get("forms")))
+    if raw is None:
+        raw = policy
+    entries: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(key, str) and key.casefold() in INDONESIAN_PARTICLES:
+                entries[key.casefold()] = value
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                entries[item.casefold()] = {}
+            elif isinstance(item, dict):
+                form = item.get("form", item.get("particle"))
+                if isinstance(form, str):
+                    entries[form.casefold()] = item
+    return entries
+
+
+def _id_span(path: str, text: str, start: int, end: int) -> dict[str, Any]:
+    bounded_start = max(0, min(start, len(text)))
+    bounded_end = max(bounded_start, min(end, len(text)))
+    return {"path": path, "text": text[bounded_start:bounded_end], "start": bounded_start, "end": bounded_end}
+
+
+def _id_warn_span(
+    report: Report,
+    code: str,
+    path: str,
+    message: str,
+    text: str,
+    start: int,
+    end: int,
+) -> None:
+    span = _id_span(path, text, start, end)
+    report.warning(code, path, f"{message} Evidence span: {span['text']!r}.", span)
+
+
+def _validate_id_style_profile(spec: dict[str, Any], text: str, report: Report) -> dict[str, Any] | None:
+    """Validate the context that licenses colloquial/community Indonesian."""
+
+    profile = _id_style_profile(spec)
+    words = {match.group(0).casefold() for match in _indonesian_words(text)}
+    colloquial_output = bool(words & INDONESIAN_COLLOQUIAL_MARKERS)
+    if profile is None:
+        if colloquial_output:
+            report.error(
+                "id_style_profile_required",
+                "$.id_style_profile",
+                "Colloquial or community Indonesian requires an explicit id_style_profile; use neutral editorial Indonesian when no audience/register evidence is available.",
+            )
+        return None
+    if not isinstance(spec.get("id_style_profile"), dict) and isinstance(spec.get("locale_policy"), dict) and isinstance(spec["locale_policy"].get("id_style_profile"), dict):
+        profile_path = "$.locale_policy.id_style_profile"
+    else:
+        profile_path = "$.id_style_profile"
+    register = _id_register(profile)
+    if register not in INDONESIAN_REGISTERS:
+        report.error("id_style_profile_register", f"{profile_path}.register", "register must be an explicit supported Indonesian register.")
+        register = None
+    if register in INDONESIAN_COLLOQUIAL_REGISTERS or colloquial_output:
+        required_fields = ("channel", "audience_relation", "region_or_community", "pronoun_policy", "particle_policy", "code_switch_policy")
+        for key in required_fields:
+            value = profile.get(key)
+            valid = _nonempty_string(value) if key in {"channel", "audience_relation", "region_or_community"} else isinstance(value, (dict, list))
+            if not valid:
+                report.error("id_style_profile_field", f"{profile_path}.{key}", "Colloquial/community output requires this register policy field; do not infer slang, region, or particles.")
+        region = profile.get("region_or_community")
+        if isinstance(region, str) and region.casefold() in {"default", "unspecified", "any", "jakarta default"}:
+            report.error("id_style_profile_region", f"{profile_path}.region_or_community", "Region/community must be explicit; Jakarta is not a national default.")
+    return profile
+
+
+def _validate_id_profile_authority(
+    spec: dict[str, Any],
+    text: str,
+    profile: dict[str, Any] | None,
+    brand: Any,
+    brand_bundle: dict[str, Any] | None,
+    expected_scope: dict[str, str] | None,
+    report: Report,
+) -> None:
+    """Bind embedded register choices to external Brand Copy evidence when available."""
+
+    if profile is None:
+        return
+    authoritative = _id_authoritative_profile(brand, brand_bundle)
+    profile_path = "$.id_style_profile" if isinstance(spec.get("id_style_profile"), dict) else "$.locale_policy.id_style_profile"
+    if authoritative is not None:
+        if profile != authoritative:
+            report.error(
+                "id_style_profile_authority",
+                profile_path,
+                "When a canonical Brand Copy profile or validated bundle supplies id_style_profile, content must use that exact external profile.",
+            )
+        return
+    production = _anti_slop_route_required(spec, spec.get("state"))
+    if _id_is_colloquial_output(text, profile):
+        if not _id_profile_source_ids(profile):
+            report.error(
+                "id_style_profile_evidence",
+                profile_path,
+                "Embedded colloquial/community id_style_profile needs non-empty source_ids/evidence_ids; a content record cannot self-attest a voice or community.",
+            )
+        elif production:
+            source_ids = set(_id_profile_source_ids(profile))
+            resolved_ids = _id_resolved_style_source_ids(spec, expected_scope)
+            missing = sorted(source_ids - resolved_ids)
+            if missing:
+                report.error(
+                    "id_style_profile_source_unresolved",
+                    profile_path,
+                    f"Embedded style/register source_ids must resolve to scoped packet evidence explicitly tagged style/register; unresolved: {missing}.",
+                )
+        code_switch_policy = profile.get("code_switch_policy")
+        if not isinstance(code_switch_policy, (dict, list)):
+            report.error("id_style_profile_field", f"{profile_path}.code_switch_policy", "Colloquial/community code-switch policy must be structured and evidence-backed.")
+        particle_policy = profile.get("particle_policy")
+        if not isinstance(particle_policy, (dict, list)):
+            report.error("id_style_profile_field", f"{profile_path}.particle_policy", "Colloquial/community particle policy must be structured and evidence-backed.")
+        if production:
+            words = {match.group(0).casefold() for match in _indonesian_words(text)}
+            particle_entries = _id_particle_entries(profile)
+            if words & INDONESIAN_PARTICLES and not particle_entries:
+                report.error("id_style_profile_particle_authority", f"{profile_path}.particle_policy", "Colloquial/community particles require approved provenance/function entries before production.")
+            code_switch_terms = _id_policy_terms(code_switch_policy)
+            if any(re.search(re.escape(phrase), text, flags=re.IGNORECASE) for phrase in INDONESIAN_CODE_SWITCH_PHRASES) and not code_switch_terms:
+                report.error("id_style_profile_code_switch_authority", f"{profile_path}.code_switch_policy", "English/UI terms in colloquial/community production require approved code-switch terms and reasons.")
+    scope = profile.get("scope")
+    if scope is not None:
+        expected = _scope_with_brand(expected_scope)
+        if expected is None or scope != expected:
+            report.error("id_style_profile_scope", f"{profile_path}.scope", "Embedded id_style_profile scope must exactly match the content isolation scope.")
+
+
+def _validate_id_orthography_review(spec: dict[str, Any], report: Report) -> None:
+    """Validate optional EYD V evidence independently from naturalness findings."""
+
+    review = spec.get("eyd_review", spec.get("ey_d_review"))
+    if review is None and isinstance(spec.get("copy_quality_audit"), dict):
+        review = spec["copy_quality_audit"].get("eyd_review", spec["copy_quality_audit"].get("ey_d_review"))
+    if review is None:
+        return
+    path = "$.eyd_review" if spec.get("eyd_review") is not None else "$.ey_d_review"
+    if not isinstance(review, dict):
+        report.error("id_eyd_review_type", path, "EYD review must be a structured object and is independent from register naturalness.")
+        return
+    if review.get("status") not in {"pending", "pass", "fail", "not_applicable"}:
+        report.error("id_eyd_review_status", f"{path}.status", "EYD review status must be pending, pass, fail, or not_applicable.")
+    if review.get("standard", "EYD V") != "EYD V":
+        report.error("id_eyd_review_standard", f"{path}.standard", "Orthography evidence must name EYD V; it must not be used as a naturalness score.")
+    findings = review.get("findings", [])
+    if not isinstance(findings, list):
+        report.error("id_eyd_review_findings", f"{path}.findings", "EYD findings must be a list.")
+
+
+def _visible_copy_digest(spec: dict[str, Any]) -> str:
+    slides = []
+    for slide in spec.get("slides", []) if isinstance(spec.get("slides"), list) else []:
+        if isinstance(slide, dict):
+            slides.append({key: slide.get(key) for key in ("headline", "body", "cta")})
+    payload = {
+        "single_message": spec.get("single_message"),
+        "slides": slides,
+        "caption": spec.get("caption"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_id_production_review(
+    spec: dict[str, Any],
+    audit: dict[str, Any],
+    profile: dict[str, Any] | None,
+    expected_scope: dict[str, str] | None,
+    policy: dict[str, Any] | None,
+    actor_id: str | None,
+    report: Report,
+) -> None:
+    review = audit.get("indonesian_review", audit.get("id_review", audit.get("locale_review")))
+    if not isinstance(review, dict):
+        report.error(
+            "id_copy_review_required",
+            "$.copy_quality_audit.indonesian_review",
+            "Production copy audit must record a native/pairwise review or an explicit neutral-editorial fallback.",
+        )
+        return
+    method = review.get("method", review.get("mode"))
+    if method not in ID_REVIEW_METHODS:
+        report.error("id_copy_review_method", "$.copy_quality_audit.indonesian_review.method", "Use a native editor, pairwise native review, or neutral_editorial_fallback.")
+    if review.get("status") not in {"pass", "accepted", "fallback"}:
+        report.error("id_copy_review_status", "$.copy_quality_audit.indonesian_review.status", "Indonesian copy review must record pass/accepted or fallback status.")
+    expected_full_scope = _scope_with_brand(expected_scope)
+    if expected_full_scope is None or review.get("scope") != expected_full_scope:
+        report.error("id_copy_review_scope", "$.copy_quality_audit.indonesian_review.scope", "Review evidence must carry the exact tenant/client/product/brand scope.")
+    expected_digest = _visible_copy_digest(spec)
+    if review.get("reviewed_copy_digest") != expected_digest:
+        report.error("id_copy_review_copy_digest", "$.copy_quality_audit.indonesian_review.reviewed_copy_digest", "Review must bind the exact visible-copy digest.")
+    if _parse_datetime(review.get("reviewed_at")) is None:
+        report.error("id_copy_review_timestamp", "$.copy_quality_audit.indonesian_review.reviewed_at", "Review evidence requires a timezone-aware reviewed_at timestamp.")
+    if method in {"neutral_editorial_fallback", "neutral-editorial-fallback"}:
+        if _id_register(profile) != "neutral_editorial":
+            report.error("id_copy_review_fallback_register", "$.copy_quality_audit.indonesian_review.method", "Neutral-editorial fallback is allowed only with id_style_profile.register neutral_editorial; it cannot authorize colloquial/community output.")
+        if not isinstance(profile, dict):
+            report.error("id_copy_review_fallback_profile", "$.id_style_profile", "Neutral-editorial fallback requires an explicit scoped id_style_profile.")
+        else:
+            if review.get("profile_checksum") != _id_profile_digest(profile):
+                report.error("id_copy_review_profile_checksum", "$.copy_quality_audit.indonesian_review.profile_checksum", "Fallback must bind the exact id_style_profile checksum.")
+            if profile.get("scope") != expected_full_scope:
+                report.error("id_style_profile_scope", "$.id_style_profile.scope", "Neutral fallback profile must carry the exact content scope.")
+        if not _nonempty_string(review.get("reason", review.get("rationale"))):
+            report.error("id_copy_review_fallback_reason", "$.copy_quality_audit.indonesian_review.reason", "Neutral-editorial fallback must state why native/pairwise review was unavailable.")
+        return
+    reviewer_id = review.get("reviewer_id")
+    reviewer_role = review.get("reviewer_role", "reviewer")
+    trusted = policy.get("raw", {}) if isinstance(policy, dict) else {}
+    if not _nonempty_string(reviewer_id) or reviewer_id != actor_id:
+        report.error("id_copy_review_reviewer", "$.copy_quality_audit.indonesian_review.reviewer_id", "Native/pairwise review must bind the current authenticated reviewer identity.")
+    if reviewer_role not in {"reviewer", "lead"} or not _mapped_identity(trusted, reviewer_id, reviewer_role):
+        report.error("id_copy_review_reviewer_role", "$.copy_quality_audit.indonesian_review.reviewer_role", "Native/pairwise reviewer must be explicitly mapped in authenticated local policy.")
+
+
+def _validate_indonesian_fluency(
+    spec: dict[str, Any],
+    report: Report,
+    *,
+    brand: Any = None,
+    brand_bundle: dict[str, Any] | None = None,
+    expected_scope: dict[str, str] | None = None,
+) -> None:
+    """Warn on explainable register/translation residue while preserving ellipsis."""
+
+    units = _indonesian_text_units(spec)
+    text = "\n".join(value for _, value in units)
+    if not text or not _looks_like_indonesian(text):
+        _validate_id_orthography_review(spec, report)
+        return
+    profile = _validate_id_style_profile(spec, text, report)
+    _validate_id_profile_authority(spec, text, profile, brand, brand_bundle, expected_scope, report)
+    _validate_id_orthography_review(spec, report)
+
+    particle_entries = _id_particle_entries(profile)
+    code_switch_policy = profile.get("code_switch_policy") if isinstance(profile, dict) else None
+    allowed_code_switches = _id_policy_terms(code_switch_policy)
+    transitions_declared = bool(isinstance(profile, dict) and (profile.get("allow_register_transitions") is True or profile.get("register_boundaries")))
+
+    for path, value in units:
+        lower = value.casefold()
+        matches = _indonesian_words(value)
+
+        # Particles are only useful when their speech act/relationship has
+        # provenance.  A profile may explicitly allow no particles.
+        for match in matches:
+            token = match.group(0).casefold()
+            if token not in INDONESIAN_PARTICLES:
+                continue
+            if profile is None:
+                continue
+            entry = particle_entries.get(token)
+            valid_entry = isinstance(entry, dict) and _nonempty_string(entry.get("function")) and (
+                _nonempty_string(entry.get("speech_act")) or _nonempty_string(entry.get("stance"))
+            ) and isinstance(entry.get("approved_examples", entry.get("examples")), list) and bool(entry.get("approved_examples", entry.get("examples")))
+            if not valid_entry:
+                _id_warn_span(
+                    report,
+                    "id_particle_without_provenance",
+                    path,
+                    "Conversational particle needs an approved function, speech act/stance, and human example; the validator does not add particles automatically.",
+                    value,
+                    match.start(),
+                    match.end(),
+                )
+
+        # English UI/product terms can be approved, but clauses and calques
+        # need an explicit reason rather than a generic "modern" voice.
+        for phrase in INDONESIAN_CODE_SWITCH_PHRASES:
+            for match in re.finditer(re.escape(phrase), lower):
+                phrase_terms = set(phrase.split())
+                if phrase.casefold() in allowed_code_switches or phrase_terms <= allowed_code_switches:
+                    continue
+                _id_warn_span(
+                    report,
+                    "id_unexplained_code_switch",
+                    path,
+                    "Code-switching is not tied to an approved product, interface, or community term.",
+                    value,
+                    match.start(),
+                    match.end(),
+                )
+        for pattern in (
+            r"\b(?:nikmati|menghadirkan|mendukung|meningkatkan|memberikan)\s+(?:pengalaman|kenyamanan|kemudahan|solusi)\b",
+            r"\b(?:dalam rangka|untuk dapat|pada akhirnya)\b",
+        ):
+            for match in re.finditer(pattern, lower):
+                if match.group(0).casefold() in allowed_code_switches:
+                    continue
+                _id_warn_span(
+                    report,
+                    "id_calque_or_translation_residue",
+                    path,
+                    "This collocation may preserve translated/abstract packaging; review it against a genre-matched Indonesian example.",
+                    value,
+                    match.start(),
+                    match.end(),
+                )
+
+        # A register jump in one copy block is a warning, not a ban.  Formal
+        # terms and a colloquial CTA may be intentional when the block boundary
+        # and reason are recorded in id_style_profile.
+        formal_matches = [match for match in matches if match.group(0).casefold() in INDONESIAN_FORMAL_MARKERS]
+        colloquial_matches = [match for match in matches if match.group(0).casefold() in INDONESIAN_COLLOQUIAL_MARKERS]
+        if formal_matches and colloquial_matches and not transitions_declared:
+            start = min(formal_matches[0].start(), colloquial_matches[0].start())
+            end = max(formal_matches[0].end(), colloquial_matches[0].end())
+            _id_warn_span(
+                report,
+                "id_register_jump",
+                path,
+                "Formal and colloquial markers share a copy block without a recorded register boundary or purpose.",
+                value,
+                start,
+                end,
+            )
+
+        # Split on sentence punctuation, while leaving fragments and ellipses
+        # alone.  No missing-subject warning is emitted: recoverable Indonesian
+        # zero arguments and headline fragments are valid editorial choices.
+        sentence_matches = list(re.finditer(r"[^.!?…]+(?:[.!?…]+|$)", value))
+        subject_occurrences: dict[str, list[tuple[re.Match[str], int]]] = {}
+        frame_occurrences: dict[str, list[tuple[re.Match[str], int]]] = {}
+        for sentence in sentence_matches:
+            sentence_text = sentence.group(0)
+            stripped = sentence_text.lstrip()
+            offset = sentence.start() + (len(sentence_text) - len(stripped))
+            if not stripped.strip():
+                continue
+            subject = re.match(
+                r"(?P<subject>kami|kita|anda|kamu|gue|gua|lu|lo|produk(?:\s+ini)?|layanan(?:\s+ini)?|tim(?:\s+kami)?|pengguna|pelanggan)\b",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            if subject:
+                subject_key = re.sub(r"\s+", " ", subject.group("subject").casefold())
+                subject_occurrences.setdefault(subject_key, []).append((subject, offset))
+                after_subject = stripped[subject.end():].lstrip()
+                aux = re.match(r"(dapat|bisa|akan|sudah|telah|perlu|harus|boleh)\b", after_subject, flags=re.IGNORECASE)
+                if aux:
+                    frame = f"{subject_key} {aux.group(1).casefold()}"
+                    frame_occurrences.setdefault(frame, []).append((subject, offset))
+        for subject, occurrences in subject_occurrences.items():
+            if len(occurrences) < 2:
+                continue
+            for occurrence, occurrence_offset in occurrences[1:]:
+                start = occurrence_offset + occurrence.start()
+                _id_warn_span(
+                    report,
+                    "id_explicit_subject_repeat",
+                    path,
+                    f"Explicit subject {subject!r} repeats across clauses; review whether the referent is already recoverable or whether a contrast requires it.",
+                    value,
+                    start,
+                    min(len(value), start + len(occurrence.group(0))),
+                )
+        for frame, occurrences in frame_occurrences.items():
+            if len(occurrences) < 3:
+                continue
+            occurrence, occurrence_offset = occurrences[-1]
+            start = occurrence_offset + occurrence.start()
+            _id_warn_span(
+                report,
+                "id_identical_sentence_frame",
+                path,
+                f"Sentence frame {frame!r} repeats rigidly; vary the information job only when the brief supports it.",
+                value,
+                start,
+                min(len(value), start + len(frame)),
+            )
+
+        # Abstract nominalization is only a warning when the sentence lacks a
+        # concrete actor/action/object.  Legitimate technical terms and a
+        # scene-led sentence therefore remain untouched.
+        for sentence in sentence_matches:
+            sentence_text = sentence.group(0)
+            lower_sentence = sentence_text.casefold()
+            abstract_matches = [
+                match for match in re.finditer(r"[\w-]+", lower_sentence)
+                if _id_is_derivational_nominal(match.group(0)) and match.group(0) not in INDONESIAN_CONCRETE_WORDS
+            ]
+            if len(abstract_matches) < 2:
+                continue
+            words_in_sentence = {match.group(0) for match in re.finditer(r"[\w-]+", lower_sentence)}
+            has_concrete_object = bool(words_in_sentence & INDONESIAN_CONCRETE_WORDS)
+            has_action = bool(words_in_sentence & INDONESIAN_ACTION_VERBS)
+            has_non_generic_verb = any(
+                word.startswith(("me", "ber", "di", "ter", "mem", "men", "meng", "meny")) and word not in INDONESIAN_GENERIC_VERBS
+                for word in words_in_sentence
+            )
+            if has_concrete_object or (has_action and has_non_generic_verb):
+                continue
+            _id_warn_span(
+                report,
+                "id_abstract_nominalization_cluster",
+                path,
+                "Abstract nominalizations cluster without a concrete actor, action, or object; add an observable scene or retain the formal wording only with editorial intent.",
+                value,
+                sentence.start(),
+                sentence.end(),
+            )
+
+
 def _scan_for_secrets(value: Any, report: Report, path: str = "$") -> None:
     if isinstance(value, str) and re.search(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", value, re.IGNORECASE):
         report.error("secret_value", path, "A bearer-token-like value is forbidden in content records; value redacted.")
@@ -1417,9 +2077,20 @@ def _validate_source_packet_and_brief(
         _validate_anti_scope(brief.get("scope"), "$.creative_brief.scope", expected_scope, report, required=remote_or_final)
 
 
-def _validate_copy_first_gate(spec: dict[str, Any], state: Any, report: Report) -> None:
+def _validate_copy_first_gate(
+    spec: dict[str, Any],
+    state: Any,
+    report: Report,
+    *,
+    brand: Any = None,
+    brand_bundle: dict[str, Any] | None = None,
+    expected_scope: dict[str, str] | None = None,
+    policy: dict[str, Any] | None = None,
+    actor_id: str | None = None,
+) -> None:
     """Require a human-copy brief and explainable copy-quality findings before production."""
     required = _anti_slop_route_required(spec, state)
+    _validate_indonesian_fluency(spec, report, brand=brand, brand_bundle=brand_bundle, expected_scope=expected_scope)
     brief = spec.get("human_copy_brief")
     audit = spec.get("copy_quality_audit")
     if brief is None and audit is None and not required:
@@ -1453,7 +2124,7 @@ def _validate_copy_first_gate(spec: dict[str, Any], state: Any, report: Report) 
     proof = brief.get("proof", {})
     source_refs = proof.get("source_refs") if isinstance(proof, dict) else None
     packet_ids = set(spec.get("source_packet", {}).get("proof_ids", [])) if isinstance(spec.get("source_packet"), dict) else set()
-    if not isinstance(source_refs, list) or not source_refs or any(ref not in packet_ids for ref in source_refs if isinstance(ref, str)):
+    if not isinstance(source_refs, list) or not source_refs or any(not isinstance(ref, str) or not ref.strip() or ref not in packet_ids for ref in source_refs):
         report.error("copy_quality_provenance", "$.human_copy_brief.proof.source_refs", "Copy quality cannot self-attest without source references.")
     copy_text = _all_content_text(spec).casefold()
     unsupported_intimacy = re.search(
@@ -1466,13 +2137,37 @@ def _validate_copy_first_gate(spec: dict[str, Any], state: Any, report: Report) 
     if unsupported_intimacy:
         report.error("UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM", "$.copy_quality_audit", "Personal-experience language requires provenance and explicit approval.")
     reasons = audit.get("reason_codes", [])
-    if not isinstance(reasons, list) or any(code not in COPY_QUALITY_REASON_CODES for code in reasons):
+    if not isinstance(reasons, list) or any(not isinstance(code, str) or code not in COPY_QUALITY_REASON_CODES for code in reasons):
         report.error("copy_quality_reason_codes", "$.copy_quality_audit.reason_codes", "Copy audit reason codes must use the registered explainable vocabulary.")
     findings = audit.get("findings", [])
     if not isinstance(findings, list):
         report.error("copy_quality_findings", "$.copy_quality_audit.findings", "Copy audit findings must be a list.")
-    elif required and audit.get("status") != "pass":
+    else:
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict):
+                report.error("copy_quality_finding", f"$.copy_quality_audit.findings[{index}]", "Each copy-quality finding must be an object.")
+                continue
+            code = finding.get("reason_code", finding.get("code"))
+            if isinstance(code, str) and code in INDONESIAN_REASON_CODES:
+                span = finding.get("evidence_span", finding.get("span"))
+                if not isinstance(span, dict) or not _nonempty_string(span.get("text")) or not _nonempty_string(span.get("path")):
+                    report.error(
+                        "id_copy_finding_span",
+                        f"$.copy_quality_audit.findings[{index}].evidence_span",
+                        "Indonesian fluency findings require an evidence span with text and a copy-field path.",
+                    )
+    if required and audit.get("status") != "pass":
         report.error("copy_quality_status", "$.copy_quality_audit.status", "Copy quality audit must pass before Canva mutation or final states.")
+    if required:
+        _validate_id_production_review(
+            spec,
+            audit,
+            _id_style_profile(spec),
+            expected_scope,
+            policy,
+            actor_id,
+            report,
+        )
 
 
 def _anti_slop_route_required(spec: dict[str, Any], state: Any) -> bool:
@@ -1826,6 +2521,22 @@ def _validate_page_contract(
     slides = spec.get("slides")
     if not isinstance(slides, list):
         return
+    proof_records: dict[str, dict[str, Any]] = {}
+    if isinstance(source_packet, dict):
+        raw_records = source_packet.get("proofs", source_packet.get("proof_entries", source_packet.get("evidence", [])))
+        if isinstance(raw_records, list):
+            for record in raw_records:
+                if not isinstance(record, dict):
+                    continue
+                record_id = record.get("proof_id", record.get("id", record.get("claim_id")))
+                if isinstance(record_id, str):
+                    proof_records[record_id] = record
+    claims = {
+        claim.get("claim_id"): claim
+        for claim in spec.get("claims", [])
+        if isinstance(claim, dict) and isinstance(claim.get("claim_id"), str)
+    }
+    information_jobs: dict[str, list[int]] = {}
     for index, slide in enumerate(slides):
         path = f"$.slides[{index}]"
         if not isinstance(slide, dict):
@@ -1841,6 +2552,38 @@ def _validate_page_contract(
             report.error("page_proof_ids", f"{path}.proof_ids", "Every page needs a proof_ids list of scoped IDs (empty only when no proof is used).")
         elif known_proof_ids is not None and any(item not in known_proof_ids for item in proof_ids):
             report.error("page_proof_scope", f"{path}.proof_ids", "Page proof IDs must resolve to the scoped source packet.")
+        binding = slide.get("supported_message_jobs")
+        for proof_id in proof_ids if isinstance(proof_ids, list) else []:
+            record = proof_records.get(proof_id) or claims.get(proof_id)
+            explicit_binding = (isinstance(binding, dict) and proof_id in binding) or (isinstance(binding, list) and proof_id in binding)
+            if not isinstance(record, dict):
+                if not explicit_binding:
+                    report.error("page_proof_evidence_missing", f"{path}.proof_ids", f"Proof ID {proof_id!r} has no scoped source entry/claim or explicit supported_message_jobs binding.")
+                continue
+            source_text = " ".join(str(record.get(key, "")) for key in ("content", "summary", "proof", "claim", "text", "description"))
+            visible_text = " ".join(str(slide.get(key, "")) for key in ("headline", "body", "cta", "information_job"))
+            source_keywords = _tokens(source_text)
+            visible_keywords = _tokens(visible_text)
+            supported_jobs = record.get("supported_message_jobs", [])
+            job_binding = isinstance(supported_jobs, list) and any(_tokens(str(job)) & _tokens(str(slide.get("information_job", ""))) for job in supported_jobs)
+            if not explicit_binding and not (source_keywords & visible_keywords) and not job_binding:
+                report.error("page_proof_linkage", f"{path}.proof_ids", f"Proof ID {proof_id!r} does not semantically support this slide's visible copy; add matching content/summary keywords or an explicit supported_message_jobs binding.")
+        information_job = slide.get("information_job", slide.get("message_job"))
+        progression = slide.get("progression")
+        if not _nonempty_string(information_job):
+            report.error("slide_information_job_missing", f"{path}.information_job", "Production slides must state their distinct information job.")
+        else:
+            job_key = re.sub(r"\s+", " ", information_job.casefold().strip())
+            information_jobs.setdefault(job_key, []).append(index + 1)
+        if isinstance(progression, dict):
+            progression_valid = any(_nonempty_string(progression.get(key)) for key in ("advances", "from_previous", "next_step", "what_changes"))
+        else:
+            progression_valid = _nonempty_string(progression)
+        if not progression_valid:
+            report.error("slide_progression_missing", f"{path}.progression", "Production slides must record how this slide advances the audience from the previous job.")
+    for job, slide_numbers in information_jobs.items():
+        if len(slide_numbers) > 1:
+            report.error("slide_information_job_duplicate", "$.slides", f"Each production slide needs a distinct information job; {job!r} repeats on slides {slide_numbers}.")
 
 
 def _validate_evidence_status(value: Any, path: str, report: Report) -> str | None:
@@ -1876,6 +2619,11 @@ def _anti_slop_package_checksum(spec: dict[str, Any], audit: dict[str, Any]) -> 
         "creative_brief": spec.get("creative_brief"),
         "art_direction": spec.get("art_direction"),
         "production_controls": spec.get("production_controls"),
+        "single_message": spec.get("single_message"),
+        "slides": spec.get("slides"),
+        "caption": spec.get("caption"),
+        "id_style_profile": spec.get("id_style_profile", spec.get("locale_policy", {}).get("id_style_profile") if isinstance(spec.get("locale_policy"), dict) else None),
+        "copy_quality_audit": spec.get("copy_quality_audit"),
         "evidence": audit.get("evidence"),
         "findings": audit.get("findings"),
         "hard_blockers": audit.get("hard_blockers"),
@@ -2290,7 +3038,11 @@ def calculate_package_checksum(spec: dict[str, Any]) -> str | None:
             and isinstance(spec.get("anti_slop_audit", {}).get("approval_package"), dict)
             else None
         ),
+        "single_message": spec.get("single_message"),
+        "slides": spec.get("slides"),
         "caption": spec.get("caption"),
+        "id_style_profile": spec.get("id_style_profile", spec.get("locale_policy", {}).get("id_style_profile") if isinstance(spec.get("locale_policy"), dict) else None),
+        "copy_quality_audit": spec.get("copy_quality_audit"),
         "alt_text": spec.get("alt_text"),
         "target_account": publishing.get("target_account"),
         "scheduled_at": publishing.get("scheduled_at"),
@@ -3149,7 +3901,16 @@ def validate_content_spec(
                 report.error("approval_missing", "$.approval.status", "Lifecycle state requires an approved human decision.")
 
     _validate_measurement(spec, spec.get("measurement"), state, published_at, report)
-    _validate_copy_first_gate(spec, state, report)
+    _validate_copy_first_gate(
+        spec,
+        state,
+        report,
+        brand=brand,
+        brand_bundle=bundle,
+        expected_scope=canonical_scope,
+        policy=policy,
+        actor_id=actor_id,
+    )
     _validate_anti_slop_audit(spec, canonical_scope, state, template_entries, report)
 
     return report

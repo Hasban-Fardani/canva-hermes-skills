@@ -86,6 +86,31 @@ export checksum, selected route, and a deterministic checksum. The existing
 `approval.package_checksum` also includes the selected route and audit package
 checksum, so changing either after approval invalidates the package.
 
+### Indonesian fluency and register review
+
+Indonesian naturalness is a configurable editorial review, separate from EYD V
+correctness. The optional top-level `id_style_profile` is required whenever the
+copy uses a colloquial or community-specific register. It records at least
+`register`, `channel`, `audience_relation`, `region_or_community`,
+`pronoun_policy`, `particle_policy`, and `code_switch_policy`. A neutral or
+formal draft may omit the profile; the validator then does not invent slang,
+particles, typos, regional speech, or a Jakarta default.
+
+The validator reports warnings with an `evidence_span` for repeated explicit
+subject frames, rigid identical sentence frames, abstract nominalization
+clusters without an actor/action/object, particles without provenance or
+function, unexplained code-switching/calques, and unmanaged register jumps.
+These are review prompts, not blanket bans. Recoverable subject/object ellipsis,
+headline fragments, and deliberate punctuation remain valid. EYD evidence may
+be recorded independently in `eyd_review` (standard `EYD V`) and must not be
+used as a proxy for conversational naturalness.
+
+For production copy (`DESIGN_DRAFT` with a production route, or any later
+state), `copy_quality_audit.indonesian_review` records either a native editor or
+pairwise native review (`method`, `reviewer_id`, `reviewed_at`) or an explicit
+`neutral_editorial_fallback` with a rationale. The record must not claim native
+review when that evidence is unavailable.
+
 ### Legacy compatibility
 
 Records without the additive anti-slop contract remain readable in early
@@ -121,6 +146,9 @@ keeping remote mutation and approval fail-closed.
 | `art_direction` | Selected-route visual premise and exactly one distinctive move |
 | `production_controls` | Approved template, folder, Brand Controls snapshot, locks, and editable slots |
 | `anti_slop_audit` | Explainable findings, 0–5 slop dimensions, rubric, evidence, blockers, critique, and package |
+| `id_style_profile` | Audience- and channel-scoped Indonesian register policy when colloquial/community copy is used |
+| `copy_quality_audit` | Explainable copy findings, Indonesian evidence spans, and production review provenance |
+| `eyd_review` | Optional independent EYD V correctness review; never a naturalness score |
 | `experiment` | One-variable hypothesis/variant contract or `none` |
 | `slides` | Ordered creative units, even for a one-slide static post |
 | `caption` | `hook`, `body`, `cta`, and `hashtags` |
@@ -311,7 +339,16 @@ Each item contains:
 - `role`: `cover`, `context`, `explanation`, `proof`, `steps`, `cta`, or `other`;
 - `headline`, `body`, `cta`: visible copy;
 - `visual_direction`: composition, imagery, and hierarchy, not vague mood words;
-- `accessibility_note`: reading order, contrast, or non-color cue guidance.
+- `accessibility_note`: reading order, contrast, or non-color cue guidance;
+- `information_job`: the distinct knowledge or decision this slide gives the reader;
+- `progression`: how this slide advances from the previous slide (a concise
+  string or an object with `advances`, `from_previous`, `next_step`, or
+  `what_changes`).
+
+Production carousels must give every slide a distinct `information_job` and a
+non-empty `progression`; repeating a visual role or grammatical shape is not
+progression. A cover may use a fragment when the visual makes its referent
+recoverable.
 
 Use the field budgets in the selected brand profile. A single static post still
 uses a one-item `slides` list. A carousel cover should carry the promise, not a

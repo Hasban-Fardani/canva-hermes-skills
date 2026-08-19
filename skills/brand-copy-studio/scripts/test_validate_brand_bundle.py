@@ -770,6 +770,116 @@ class BrandBundleValidatorTests(unittest.TestCase):
         self.assertIn("distinctive_assets", self.docs["brand-profile.json"])
         self.assertEqual(validate_brand_bundle(self.root), [])
 
+    def _id_style_profile(self, register: str = "friendly_conversational") -> dict:
+        return {
+            "channel": ["caption"],
+            "register": register,
+            "audience_relation": "customer",
+            "region_or_community": "national",
+            "pronoun_policy": {
+                "approved": ["kamu"],
+                "avoid": ["gue", "lu"],
+                "evidence_status": "exact",
+                "source_ids": ["source-1"],
+            },
+            "particle_policy": {
+                "approved": [
+                    {
+                        "particle": "yuk",
+                        "speech_act": "invitation",
+                        "function": "invites a concrete next action",
+                        "audience_relation": "customer",
+                        "region_or_community": "national",
+                        "approved_examples": ["Yuk, cek detailnya."],
+                        "evidence_status": "exact",
+                        "source_ids": ["source-1"],
+                    }
+                ],
+                "prohibited": [],
+                "no_forced_slang": True,
+                "evidence_status": "exact",
+                "source_ids": ["source-1"],
+            },
+            "code_switch_policy": {
+                "allowed_terms": [],
+                "do_not_translate": [],
+                "translate_surrounding_syntax": True,
+                "evidence_status": "exact",
+                "source_ids": ["source-1"],
+            },
+            "contraction_spelling_policy": {
+                "approved_forms": ["sudah"],
+                "standard_forms": ["sudah"],
+                "prohibited_forms": [],
+                "default_spelling": "standard",
+                "rules": ["Use approved forms consistently within a channel."],
+                "evidence_status": "exact",
+                "source_ids": ["source-1"],
+            },
+            "approved_human_examples": [
+                {
+                    "id": "id-example-1",
+                    "example": "Yuk, cek detailnya sebelum memilih.",
+                    "channel": "caption",
+                    "register": register,
+                    "audience_relation": "customer",
+                    "region_or_community": "national",
+                    "evidence_status": "exact",
+                    "source_ids": ["source-1"],
+                }
+            ],
+            "evidence_status": "exact",
+            "source_ids": ["source-1"],
+        }
+
+    def test_id_style_profile_is_optional_for_legacy_drafts(self) -> None:
+        self.docs["brand-profile.json"]["id_style_profile"] = {"register": "friendly_conversational"}
+        self._write_docs()
+        self.assertEqual(validate_brand_bundle(self.root), [])
+
+    def test_active_colloquial_style_profile_fails_closed_when_incomplete(self) -> None:
+        policy = self._make_active_with_authority()
+        self.docs["brand-profile.json"]["id_style_profile"] = {"register": "friendly_conversational"}
+        self._write_docs()
+        errors = validate_brand_bundle(self.root, policy=policy, actor_id="admin-1")
+        self.assertTrue(any("id_style_profile.channel: required for privileged style output" in error for error in errors))
+        self.assertTrue(any("id_style_profile: missing 'evidence_status'" in error for error in errors))
+
+    def test_active_colloquial_style_profile_accepts_evidenced_contract(self) -> None:
+        policy = self._make_active_with_authority()
+        self.docs["brand-profile.json"]["id_style_profile"] = self._id_style_profile()
+        self._write_docs()
+        self.assertEqual(validate_brand_bundle(self.root, policy=policy, actor_id="admin-1"), [])
+
+    def test_active_colloquial_style_profile_requires_no_forced_slang(self) -> None:
+        policy = self._make_active_with_authority()
+        style = self._id_style_profile()
+        style["particle_policy"]["no_forced_slang"] = False
+        self.docs["brand-profile.json"]["id_style_profile"] = style
+        self._write_docs()
+        errors = validate_brand_bundle(self.root, policy=policy, actor_id="admin-1")
+        self.assertTrue(any("particle_policy.no_forced_slang: must be true" in error for error in errors))
+
+    def test_active_particle_entry_requires_speech_act_function_and_example(self) -> None:
+        policy = self._make_active_with_authority()
+        style = self._id_style_profile()
+        particle = style["particle_policy"]["approved"][0]
+        del particle["speech_act"]
+        del particle["function"]
+        particle["approved_examples"] = []
+        self.docs["brand-profile.json"]["id_style_profile"] = style
+        self._write_docs()
+        errors = validate_brand_bundle(self.root, policy=policy, actor_id="admin-1")
+        self.assertTrue(any("particle_policy.approved[0].speech_act: must be" in error for error in errors))
+        self.assertTrue(any("particle_policy.approved[0].function: must be" in error for error in errors))
+        self.assertTrue(any("particle_policy.approved[0].approved_examples: must be" in error for error in errors))
+
+    def test_id_style_profile_compatibility_alias_is_accepted(self) -> None:
+        policy = self._make_active_with_authority()
+        self.docs["brand-profile.json"]["indonesian_style_profile"] = self._id_style_profile(register="formal_public")
+        self._write_docs()
+        self.assertEqual(validate_brand_bundle(self.root, policy=policy, actor_id="admin-1"), [])
+
     def _make_active_with_authority(self) -> dict:
         self._make_scoped()
         for document in self.docs.values():

@@ -122,6 +122,13 @@ content-production skill after a local brand snapshot exists.
     details, voice as behavior, approved verbal assets/owned vocabulary,
     Indonesian locale and code-switch policy, and fake-intimacy or unsupported
     first-person constraints.
+    For Indonesian output, capture the additive `id_style_profile` when the
+    target voice is known: channel/register, audience relation,
+    region/community, pronoun/address policy, speech-act-aware particle policy,
+    code-switch and do-not-translate rules, contraction/spelling policy, and
+    approved human examples. Do not add slang to fill a missing profile. A
+    privileged or active colloquial/community-specific profile must be
+    complete and evidence-backed; drafts may remain incomplete.
     Drafts may leave these fields incomplete; `active` and approved registry
     records may not.
 
@@ -162,6 +169,15 @@ The additive anti-slop contract is defined in
 human approval for privileged model use and binds feedback reason codes to the
 exact tenant/client/brand/product scope. The validator emits explainable
 field/reason errors; it never computes an AI detector score.
+
+For Indonesian copy, [references/canonical-schema.md](references/canonical-schema.md)
+defines the optional, backward-compatible `id_style_profile`. If it is absent,
+keep output in neutral Indonesian. If it declares a colloquial, fandom, local,
+or community-specific register in an active/approved bundle, the validator
+fails closed until the profile's audience relationship, region/community,
+pronouns, particles, code switches, spelling, and approved human examples are
+evidenced. Particle entries must state their speech act, function, and example;
+the profile's `no_forced_slang` safeguard prevents decorative slang.
 
 Start new work from the empty templates in `assets/`; they contain no real brand
 data. Validate all four files together with:

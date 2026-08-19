@@ -128,6 +128,85 @@ legacy drafts remain readable:
 - `fake_intimacy_policy` and `unsupported_first_person_policy`: explicit
   constraints against invented diary voice, testimonials, or ungrounded “we/I”
   experience.
+- `id_style_profile`: an additive Indonesian register contract. It records the
+  target `channel`, `register`, `audience_relation`, and `region_or_community`,
+  plus `pronoun_policy`, `particle_policy`, `code_switch_policy`,
+  `contraction_spelling_policy`, and `approved_human_examples`. The validator
+  also accepts `indonesian_style_profile` as a compatibility alias, but emits
+  and documents `id_style_profile` as the canonical key.
+
+The `id_style_profile` shape is intentionally explicit and evidence-oriented:
+
+```json
+{
+  "id_style_profile": {
+    "channel": [],
+    "register": "",
+    "audience_relation": "",
+    "region_or_community": "",
+    "pronoun_policy": {
+      "approved": [],
+      "avoid": [],
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "particle_policy": {
+      "approved": [],
+      "no_forced_slang": true,
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "code_switch_policy": {
+      "allowed_terms": [],
+      "do_not_translate": [],
+      "translate_surrounding_syntax": true,
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "contraction_spelling_policy": {
+      "approved_forms": [],
+      "standard_forms": [],
+      "prohibited_forms": [],
+      "default_spelling": "",
+      "rules": [],
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "approved_human_examples": [],
+    "evidence_status": "unverified",
+    "source_ids": []
+  }
+}
+```
+
+Every approved particle entry must identify the particle, its `speech_act`
+(`speech_acts` is also accepted), its pragmatic `function`, and one or more
+`approved_examples`, with evidence metadata. An empty approved-particle list
+is valid when the profile deliberately uses no particles; `no_forced_slang`
+must remain `true` for privileged output. `code_switch_policy.allowed_terms`
+and `do_not_translate` are lists of evidence-backed objects with a `term` and
+`reason` in privileged profiles. `contraction_spelling_policy` separates
+approved colloquial forms from standard and prohibited forms; it does not
+require a contraction or typo. Approved human examples carry their own
+channel/register/audience/region metadata and evidence status.
+
+The profile is optional for legacy bundles. Draft profiles may be empty or
+incomplete while evidence is collected. If an active bundle or an approved
+claim/template declares a colloquial or community-specific register, the
+validator fails closed unless the full profile, policy evidence, approved human
+examples, and source references are present and exact/observed. It never
+converts slang density, particles, spelling variation, or any other property
+into an AI detector or universal naturalness score. If the profile is absent,
+generation should use neutral Indonesian rather than inventing a community
+voice.
+
+Use register values such as `formal_public`, `neutral_editorial`,
+`friendly_conversational`, or `community_specific`; `fandom` and
+`local_activation` are available when the supplied audience evidence supports
+them. Channel values identify where the line will appear (for example,
+`caption`, `carousel`, `website`, `comment`, `chat`, or `spoken_script`). The
+region/community field may be `national` or a specifically evidenced place or
+community; it is not a license to treat Jakarta usage as a national default.
 
 Each creative-contract record carries `id`, a non-empty text/value field,
 `evidence_status`, and `source_ids`. A distinctive asset additionally requires

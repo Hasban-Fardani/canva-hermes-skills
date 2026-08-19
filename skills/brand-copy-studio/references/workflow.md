@@ -26,6 +26,13 @@ for authorization, approval, and any ambiguous interpretation.
    observable behavior, brand stance/right-to-speak, deliberate refusals,
    concrete proof details, voice-as-behavior, approved verbal assets, locale
    and code-switching rules, and fake-intimacy/unsupported-first-person limits.
+8. When Indonesian copy is requested with a non-neutral voice, add
+   `id_style_profile`: record the channel/register, audience relationship,
+   region/community, pronoun/address choices, and spelling/contraction policy.
+   Record each approved particle with its speech act, function, audience or
+   community context, and an approved human example. Keep code-switch terms
+   and do-not-translate terms separate, with a reason for each. `no_forced_slang`
+   is a guardrail, not a request to add colloquialisms.
 
 ## External observation
 
@@ -48,6 +55,10 @@ it for approved reuse or activation.
 
 Anti-slop fields collected during observation remain observed, inferred, or
 unverified; they cannot satisfy the privileged activation contract by themselves.
+The optional `id_style_profile` follows the same rule. A draft may leave it
+empty; an active or approved colloquial/community-specific profile must carry
+complete, authorized evidence and approved human examples. If no profile exists,
+use neutral Indonesian rather than inventing a regional or youth voice.
 
 When the observation targets a product, write a delta-only overlay under
 `<tenant>/<client>/<brand>/products/<product>/` and set

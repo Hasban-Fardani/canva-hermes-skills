@@ -46,6 +46,7 @@ EXPECTED_FILES = ROOT_FILES | {
     "skills/social-content-studio/SKILL.md",
     "skills/social-content-studio/agents/openai.yaml",
     "skills/social-content-studio/assets/content-spec.example.json",
+    "skills/social-content-studio/assets/indonesian-fluency-fixtures.json",
     "skills/social-content-studio/references/business-operations.md",
     "skills/social-content-studio/references/content-contract.md",
     "skills/social-content-studio/references/creative-quality.md",

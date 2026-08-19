@@ -68,3 +68,11 @@ anti-slop contract is privileged state as well: the model-use policy must make
 human approval mandatory, all four approval-role lists must be populated, and
 feedback reason codes must carry the exact tenant/client/brand/product scope.
 The external policy still supplies the authority; profile text cannot grant it.
+
+If a bundle includes `id_style_profile` with a colloquial, fandom, local, or
+community-specific register, that profile is privileged alongside the existing
+anti-slop contract. Its channel, audience relationship, region/community,
+pronoun/address, particle, code-switch, spelling, and approved-example fields
+must be complete and evidence-backed before activation or approved reuse. A
+missing profile remains backward-compatible for legacy bundles and should be
+handled as neutral Indonesian by consumers.

@@ -61,6 +61,44 @@
   "locale_policy": null,
   "fake_intimacy_policy": null,
   "unsupported_first_person_policy": null,
+  "id_style_profile": {
+    "channel": [],
+    "register": "",
+    "audience_relation": "",
+    "region_or_community": "",
+    "pronoun_policy": {
+      "approved": [],
+      "avoid": [],
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "particle_policy": {
+      "approved": [],
+      "prohibited": [],
+      "no_forced_slang": true,
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "code_switch_policy": {
+      "allowed_terms": [],
+      "do_not_translate": [],
+      "translate_surrounding_syntax": true,
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "contraction_spelling_policy": {
+      "approved_forms": [],
+      "standard_forms": [],
+      "prohibited_forms": [],
+      "default_spelling": "",
+      "rules": [],
+      "evidence_status": "unverified",
+      "source_ids": []
+    },
+    "approved_human_examples": [],
+    "evidence_status": "unverified",
+    "source_ids": []
+  },
   "rights": {
     "owner": "",
     "authorization_scope": "",

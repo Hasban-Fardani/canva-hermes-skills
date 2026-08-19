@@ -40,6 +40,20 @@
     "audience_situation": "The reader is unsure which information is actually needed and worries that corrections will restart the process.",
     "observation": "People keep the source of a changed name, location, or document in separate places, so they cannot explain the latest version.",
     "proof_ids": ["proof-organise", "proof-checklist"],
+    "proofs": [
+      {
+        "proof_id": "proof-organise",
+        "summary": "Informasi yang tidak konsisten membuat sumber dan versi sulit ditelusuri.",
+        "content": "Kelompokkan informasi yang berubah agar koreksi mudah ditemukan.",
+        "supported_message_jobs": ["context", "proof"]
+      },
+      {
+        "proof_id": "proof-checklist",
+        "summary": "Checklist data utama membantu pembaca membandingkan nama, lokasi, dan dokumen.",
+        "content": "Bandingkan data utama dan tandai bagian yang masih membutuhkan sumber.",
+        "supported_message_jobs": ["steps", "proof"]
+      }
+    ],
     "allowed_assets": ["diagram-data-flow"],
     "forbidden_claims": ["guaranteed approval", "faster processing"],
     "sources": [
