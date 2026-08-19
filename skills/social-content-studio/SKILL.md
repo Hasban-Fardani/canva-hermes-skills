@@ -83,6 +83,13 @@ Use this skill to:
    only that approved artifact and must never cross the approval gate itself.
 10. Use native image generation only for component assets when rights and brand
    rules allow it, not as a substitute for a controlled branded layout.
+11. Treat anti-slop as an explainable editorial and production gate, never an
+   AI-authorship detector. No AI probability, detector score, or human-likeness
+   field may appear in a content record.
+12. Before any Canva mutation, produce 3–5 genuinely different route cards,
+   obtain `human_selected_route`, and record one art direction with exactly one
+   distinctive move. Canva mutation, export, approval, scheduling, and
+   publishing fail closed when that evidence is missing.
 
 ## Choose a mode
 
@@ -110,6 +117,13 @@ external mutation.
 - For design or copy decisions, read `references/creative-quality.md`.
 - For calendars, analytics, lead operations, or management features, read
   `references/business-operations.md`.
+
+The anti-slop contract is documented directly in
+[`references/content-contract.md`](references/content-contract.md#anti-slop-production-contract),
+the review heuristics in
+[`references/creative-quality.md`](references/creative-quality.md#anti-slop-route-and-evidence-gate),
+and Canva mutation/export controls in
+[`references/integrations.md`](references/integrations.md#route-selection).
 - For an active brand, load the approved profile from the configured runtime
   path. Shareable skill assets contain only neutral examples; every field
   marked `unverified` must remain non-normative.
@@ -144,6 +158,10 @@ single CTA, source material, deadline, and owner. Record unknowns explicitly.
 For regulated, safety, financial, or quantitative statements, create claim
 records with source, owner, verification date, expiry, and status.
 
+Create the scoped `source_packet` and `creative_brief` before ideation. Include
+the audience situation, tension, concrete observation, proof IDs, forbidden
+claims/assets, and recent scoped hooks/CTA/layout/motif fingerprints.
+
 ### 2. Discover integrations before choosing a route
 
 Inspect available tools once and match by capability, not assumed prefixes.
@@ -175,7 +193,11 @@ The packaged generic starting point is
 contracts are [references/content-contract.md](references/content-contract.md),
 [references/integrations.md](references/integrations.md),
 [references/creative-quality.md](references/creative-quality.md), and
-[references/business-operations.md](references/business-operations.md).
+[references/business-operations.md](references/business-operations.md). The
+anti-slop validator is the literal executable contract at
+[`scripts/validate_content_spec.py`](scripts/validate_content_spec.py), with
+deterministic coverage in
+[`scripts/test_validate_content_spec.py`](scripts/test_validate_content_spec.py).
 
 Validate it before design work and after every material revision:
 
@@ -201,12 +223,19 @@ mobile thumbnail size. Keep supporting detail in later slides or the caption.
 The caption must add context rather than transcribe the artwork. Use one CTA,
 source every material claim, and provide alt text.
 
+For each selected route, write `art_direction` with one distinctive move and a
+rationale. Record page roles, visual roles, and proof IDs on every page. Bind
+the approved template/folder/Brand Controls snapshot to the active scope and
+run `anti_slop_audit` with explainable reason codes, five 0–5 slop dimensions,
+the weighted 100-point rubric, and hard-blocker evidence.
+
 Use a registry-approved template/version before freeform generation when a
 template is available. A folder name is not approval: an approved reusable
 template must have a scoped registry entry, version, approver, and approval
-timestamp. When generating candidates,
-show the actual candidate previews and wait for selection. When editing, keep
-the transaction uncommitted until the user approves the proposed operations.
+timestamp. Generate and show 3–5 genuinely different route cards before
+candidate previews; wait for `human_selected_route` before any Canva mutation.
+When editing, keep the transaction uncommitted until the user approves the
+proposed operations.
 
 ### 5. Review the rendered artifact
 

@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from validate_content_spec import calculate_package_checksum, validate_content_spec  # noqa: E402
+from validate_content_spec import _anti_slop_package_checksum, _load_brand_bundle_validator, calculate_package_checksum, load_trusted_policy, validate_content_spec  # noqa: E402
 
 
 TEST_EXPORT_DIR = tempfile.TemporaryDirectory(prefix="social-content-validator-")
@@ -28,30 +28,33 @@ def load_json(name: str) -> dict:
         return json.load(handle)
 
 
-def trusted_policy(spec: dict) -> dict:
+def trusted_policy(spec: dict, *, scope_override: dict | None = None, revision_override: str | None = None, provider_override: str | None = None):
     policy = spec["policy"]
-    unattended = policy.get("unattended") if isinstance(policy.get("unattended"), dict) else {}
-    preapproved = unattended.get("preapproved") if isinstance(unattended.get("preapproved"), dict) else {}
-    return {
+    payload = {
         "schema_version": policy["schema_version"],
         "policy_id": policy["policy_id"],
-        "revision": policy["revision"],
+        "revision": revision_override or policy["revision"],
         "source": policy["source"],
-        "scope": dict(policy["scope"]),
+        "scope": dict(scope_override or policy["scope"]),
         "role_mapping": json.loads(json.dumps(policy["role_mapping"])),
         "actor_id": policy["actor_id"],
         "actor_role": policy["actor_role"],
-        "unattended": {
-            "preapproved": {
-                "template_provider_ids": json.loads(json.dumps(preapproved.get("template_provider_ids", {})))
-            }
-        },
+        # The external policy fixture intentionally mirrors the complete
+        # capability-bearing unattended subtree.  Partial copies are rejected
+        # by the trusted-policy boundary.
+        "unattended": json.loads(json.dumps(policy.get("unattended", {}))),
     }
+    if provider_override:
+        payload["unattended"]["preapproved"]["template_provider_ids"]["brand-template-001"] = provider_override
+    handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(payload, handle)
+    handle.close()
+    return load_trusted_policy(Path(handle.name))
 
 
-def trusted_brand_policy(spec: dict, *, product_id: str | None = None) -> dict:
+def trusted_brand_policy(spec: dict, *, product_id: str | None = None):
     policy = spec["policy"]
-    return {
+    payload = {
         "schema_version": "1.0",
         "policy_id": "sample-brand-policy",
         "revision": policy["revision"],
@@ -70,6 +73,12 @@ def trusted_brand_policy(spec: dict, *, product_id: str | None = None) -> dict:
             "publisher": [],
         },
     }
+    validator = _load_brand_bundle_validator()
+    assert validator is not None
+    handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(payload, handle)
+    handle.close()
+    return validator.TrustedAccessPolicyContext.from_file(handle.name)
 
 
 def full_scope(spec: dict) -> dict:
@@ -102,6 +111,43 @@ def neutral_brand_bundle(*, include_claim: bool = False) -> str:
             "visual_copy_cues": [],
             "rights": {"status": "approved"},
             "gaps": [],
+            "audience_situations": [
+                {"id": "audience-1", "situation": "A reader needs a clear next step.", "evidence_status": "exact", "source_ids": ["source-1"]}
+            ],
+            "human_proof_points": [
+                {"id": "proof-1", "proof": "A source note makes a correction traceable.", "evidence_status": "exact", "source_ids": ["source-1"]}
+            ],
+            "distinctive_assets": [
+                {"id": "asset-1", "asset": "A source thread", "role": "connects evidence to a changed field", "evidence_status": "exact", "source_ids": ["source-1"], "rights": {"status": "approved"}}
+            ],
+            "visual_principles": [
+                {"id": "visual-1", "principle": "Show relationships with editable labels.", "evidence_status": "exact", "source_ids": ["source-1"]}
+            ],
+            "composition_rules": [
+                {"id": "composition-1", "rule": "Keep one primary action per page.", "evidence_status": "exact", "source_ids": ["source-1"]}
+            ],
+            "avoid_patterns": [
+                {"id": "avoid-1", "pattern": "Unexplained decorative badges.", "evidence_status": "exact", "source_ids": ["source-1"]}
+            ],
+            "strategic_tension": {
+                "id": "tension-1", "tension": "Scattered records make corrections hard to trace.", "evidence_status": "exact", "source_ids": ["source-1"]
+            },
+            "voice_examples": {
+                "positive": [{"id": "voice-positive-1", "example": "Name the next step plainly.", "evidence_status": "exact", "source_ids": ["source-1"]}],
+                "negative": [{"id": "voice-negative-1", "example": "Avoid unsupported guarantees.", "evidence_status": "exact", "source_ids": ["source-1"]}]
+            },
+            "model_usage_policy": {
+                "allowed": ["research", "draft", "format"],
+                "restricted": ["copy"],
+                "prohibited": ["approve", "publish", "rights-clearance"],
+                "human_approval_required": True,
+                "approval_required_for": ["claims", "design", "publish"]
+            },
+            "approval_roles": {"copy": ["lead"], "claims": ["lead"], "design": ["lead"], "publish": ["lead"]},
+            "feedback_reason_codes": {
+                "scope": {"brand_id": "sample-brand", "tenant_id": "sample-tenant", "client_id": "sample-client", "product_id": ""},
+                "codes": [{"code": "TOO_GENERIC", "dimension": "distinctiveness", "description": "Message can be exchanged with another brand."}]
+            }
         },
         "claim-registry.json": {
             **envelope,
@@ -244,6 +290,7 @@ def make_approved_spec() -> dict:
     spec["design"]["provider_template_id"] = "CanvaOpaqueTemplate-EXAMPLE-001"
     spec["design"]["draft_ref"] = "canva:design:example"
     spec["design"]["render_ref"] = "<render-directory>/example-render.png"
+    spec["design"]["render_evidence"] = {"render_ref": "<render-directory>/example-render.png", "render_digest": "sha256:" + ("1" * 64), "receipt_digest": "sha256:" + ("1" * 64), "receipt_id": "render-receipt-001", "provider": "local_renderer", "verification_status": "verified", "captured_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "scope": full_scope(spec)}
     spec["design"]["remote_scope"] = full_scope(spec)
     spec["template_registry"]["entries"] = [
         {
@@ -277,7 +324,7 @@ def make_approved_spec() -> dict:
         },
     }
     for key in ("copy", "brand", "visual", "accessibility", "claims", "mobile_thumbnail"):
-        spec["qa"][key] = "pass"
+        spec["qa"][key] = {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"]}
     spec["approval"].update(
         {
             "status": "approved",
@@ -292,12 +339,62 @@ def make_approved_spec() -> dict:
             "scope_ids": full_scope(spec),
         }
     )
+    audit = spec["anti_slop_audit"]
+    audit["status"] = "pass"
+    audit["evidence"] = {
+        "ocr": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "exact_match": True},
+        "layout": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "overflow": False, "overlap": False},
+        "semantic": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "contract_tests": ["object", "count", "relation", "cta"]},
+        "wcag": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "contrast_pass": True},
+        "rights": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "assets": []},
+        "recent_similarity": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "threshold": 0.80},
+    }
+    audit["hard_blockers"] = {
+        "scope_alignment": {"status": "pass", "evidence": "scope receipt"},
+        "source_and_claim_evidence": {"status": "pass", "evidence": "source receipt"},
+        "rights_provenance": {"status": "pass", "evidence": "rights receipt"},
+        "ocr_exact_match": {"status": "pass", "evidence": "ocr receipt"},
+        "layout_integrity": {"status": "pass", "evidence": "layout receipt"},
+        "semantic_contract": {"status": "pass", "evidence": "semantic receipt"},
+        "wcag_accessibility": {"status": "pass", "evidence": "wcag receipt"},
+        "template_controls": {"status": "pass", "evidence": "template receipt"},
+        "approval_package": {"status": "pass", "evidence": "approval receipt"},
+    }
+    audit["independent_critique"] = {
+        "status": "pass",
+        "reviewer_id": "independent-critic-fixture",
+        "independent_from_generation": True,
+        "findings": [],
+    }
+    audit["approval_package"] = {
+        "scope": full_scope(spec),
+        "content_id": spec["content_id"],
+        "render_digest": "sha256:" + ("1" * 64),
+        "export_checksum": spec["design"]["export_checksum"],
+    }
+    audit["approval_package"]["checksum"] = _anti_slop_package_checksum(spec, audit)
     spec["approval"]["package_checksum"] = calculate_package_checksum(spec)
     return spec
 
 
 class ValidatorTests(unittest.TestCase):
     TODAY = date(2026, 8, 19)
+
+    def test_malformed_route_and_proof_ids_fail_structurally_without_crashing(self) -> None:
+        for malformed_route_id in ({}, [], None):
+            spec = load_json("content-spec.example.json")
+            spec["route_set"]["routes"][0]["route_id"] = malformed_route_id
+            report = validate_content_spec(spec, approved_brand(), self.TODAY)
+            self.assertTrue(report.errors)
+        for malformed_proof_id in ({}, [], None):
+            spec = load_json("content-spec.example.json")
+            spec["source_packet"]["proof_ids"] = [malformed_proof_id]
+            report = validate_content_spec(spec, approved_brand(), self.TODAY)
+            self.assertTrue(report.errors)
+
+    def test_approval_checksum_matches_independent_golden_literal(self) -> None:
+        spec = make_approved_spec()
+        self.assertEqual("sha256:fdaca8c011cf5f168a17e90d6994546683d3a8480381f554805c555a0c3d17cb", calculate_package_checksum(spec))
 
     def test_early_example_passes_with_approved_brand(self) -> None:
         spec = load_json("content-spec.example.json")
@@ -449,6 +546,72 @@ class ValidatorTests(unittest.TestCase):
         report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
         self.assertEqual([], report.issues)
 
+    def test_valid_new_anti_slop_draft(self) -> None:
+        spec = load_json("content-spec.example.json")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="member-fixture")
+        self.assertEqual([], report.errors)
+        self.assertTrue(report.passes(strict=True))
+
+    def test_generic_route_is_rejected_with_explainable_code(self) -> None:
+        spec = load_json("content-spec.example.json")
+        spec["route_set"]["routes"][0]["strategic_idea"] = "Konten edukasi untuk meningkatkan awareness."
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("generic_route", {issue.code for issue in report.errors})
+
+    def test_route_cards_must_be_genuinely_distinct(self) -> None:
+        spec = load_json("content-spec.example.json")
+        first = spec["route_set"]["routes"][0]
+        second = spec["route_set"]["routes"][1]
+        for key in ("strategic_idea", "audience_tension", "message_promise", "visual_premise", "narrative_order", "asset_plan", "distinctive_move"):
+            second[key] = first[key]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("routes_not_distinct", {issue.code for issue in report.errors})
+
+    def test_canva_mutation_requires_human_route_selection(self) -> None:
+        spec = load_json("content-spec.example.json")
+        spec["state"] = "DESIGN_DRAFT"
+        spec["design"]["draft_ref"] = "canva:design:unselected"
+        spec["human_selected_route"] = None
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("human_selected_route_required", {issue.code for issue in report.errors})
+
+    def test_hard_blocker_fails_closed(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["hard_blockers"]["ocr_exact_match"] = "fail"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("hard_blocker", {issue.code for issue in report.errors})
+
+    def test_valid_privileged_anti_slop_contract(self) -> None:
+        spec = make_approved_spec()
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertEqual([], report.errors)
+        self.assertTrue(report.passes(strict=True))
+
+    def test_selected_route_change_invalidates_approval_package(self) -> None:
+        spec = make_approved_spec()
+        spec["human_selected_route"]["route_id"] = "proof-demo"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("approval_checksum_mismatch", codes)
+        self.assertIn("anti_slop_package_checksum", codes)
+
+    def test_anti_slop_scope_template_and_folder_mismatch_are_blocked(self) -> None:
+        spec = make_approved_spec()
+        spec["production_controls"]["template"]["template_id"] = "other-template"
+        spec["production_controls"]["folder"]["folder_id"] = "other-folder"
+        spec["production_controls"]["folder"]["scope"]["tenant_id"] = "other-tenant"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("template_snapshot_mismatch", codes)
+        self.assertIn("folder_snapshot_mismatch", codes)
+        self.assertIn("anti_slop_scope_mismatch", codes)
+
+    def test_universal_detector_field_is_rejected(self) -> None:
+        spec = load_json("content-spec.example.json")
+        spec["anti_slop_audit"]["ai_probability"] = 0.2
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertIn("universal_detector_field", {issue.code for issue in report.errors})
+
     def test_opaque_canva_template_id_is_exactly_bound(self) -> None:
         spec = make_approved_spec()
         report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
@@ -480,7 +643,7 @@ class ValidatorTests(unittest.TestCase):
     def test_policy_revision_must_be_bound_to_privileged_approval(self) -> None:
         spec = make_approved_spec()
         context = trusted_policy(spec)
-        context["revision"] = "2026-08-19T000001Z-r2"
+        context = trusted_policy(spec, revision_override="2026-08-19T000001Z-r2")
         report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
         self.assertIn("trusted_policy_revision", {issue.code for issue in report.errors})
 
@@ -572,7 +735,7 @@ class ValidatorTests(unittest.TestCase):
             trusted_policy(spec),
             actor_id="lead-fixture",
             brand_bundle=neutral_brand_bundle(include_claim=True),
-            brand_policy_context=trusted_policy(spec),
+            brand_policy_context=trusted_brand_policy(spec),
             brand_actor_id="lead-fixture",
         )
         self.assertIn("brand_bundle_invalid", {issue.code for issue in report.errors})
@@ -801,8 +964,7 @@ class ValidatorTests(unittest.TestCase):
         )
         self.assertEqual([], report.issues)
 
-        trusted = trusted_policy(spec)
-        trusted["unattended"]["preapproved"]["template_provider_ids"]["brand-template-001"] = "CanvaOpaqueTemplate-TRUSTED-DIFFERENT-001"
+        trusted = trusted_policy(spec, provider_override="CanvaOpaqueTemplate-TRUSTED-DIFFERENT-001")
         report = validate_content_spec(
             spec,
             approved_brand(),
@@ -926,8 +1088,7 @@ class ValidatorTests(unittest.TestCase):
         report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
         self.assertEqual([], report.issues)
 
-        context["scope"]["product_id"] = "other-product"
-        report = validate_content_spec(spec, approved_brand(), self.TODAY, context)
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec, scope_override={**full_scope(spec), "product_id": "other-product"}))
         self.assertIn("trusted_policy_scope", {issue.code for issue in report.errors})
 
     def test_measurement_plan_and_benchmark_scope_are_canonical(self) -> None:

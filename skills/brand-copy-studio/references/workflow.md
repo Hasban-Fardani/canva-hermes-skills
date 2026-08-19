@@ -18,6 +18,10 @@ for authorization, approval, and any ambiguous interpretation.
    `claim-registry`, never in approved rules.
 5. Write and validate a complete local revision of all four output files. Keep
    the revision `draft` until authorization and rights gates are satisfied.
+6. Complete the additive anti-slop creative contract in `brand-profile.json`
+   before activation: audience situations, strategic tension, human proof,
+   positive/negative voice examples, distinctive assets and visual rules,
+   model-use policy, approval roles, and scoped feedback reason codes.
 
 ## External observation
 
@@ -37,6 +41,9 @@ locator, capture time, confidence, and the authorization basis in
 `provenance.json`. A member can save the draft or compare it; only a locally
 authenticated lead/admin plus authoritative source or owner approval may clear
 it for approved reuse or activation.
+
+Anti-slop fields collected during observation remain observed, inferred, or
+unverified; they cannot satisfy the privileged activation contract by themselves.
 
 When the observation targets a product, write a delta-only overlay under
 `<tenant>/<client>/<brand>/products/<product>/` and set

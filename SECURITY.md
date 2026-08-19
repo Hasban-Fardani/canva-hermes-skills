@@ -3,12 +3,16 @@
 This repository is a generic distribution package. Do not commit credentials,
 OAuth values, cookies, account handles, provider IDs, client or brand material,
 policy instances, generated content, export receipts, signed export addresses,
-runtime JSON, caches, or local filesystem paths.
+runtime JSON, feedback, fingerprints, approvals, measurements, caches, or local
+filesystem paths.
 
 Use the provider's OAuth browser flow and secure credential store. Never paste a
 token or secret into a prompt, issue, fixture, log, test output, or pull
 request. Keep runtime data in the configured Hermes data root and apply the
-owner's retention and access policy.
+owner's retention and access policy. Anti-slop feedback, provenance, route and
+layout fingerprints, rejection reasons, approval evidence, and performance
+observations are runtime data and must remain scoped to the active
+tenant/client/product/brand/account.
 
 Before publishing a change:
 

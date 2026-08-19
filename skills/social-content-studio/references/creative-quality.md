@@ -20,6 +20,32 @@ Do not use empty directions such as “professional, premium, modern.” Transla
 them into observable choices: amount of whitespace, headline weight, image role,
 card count, grid, contrast, motion, crop, and information density.
 
+## Anti-slop route and evidence gate
+
+Before a Canva write, create three to five route cards from a scoped source
+packet and brief. Each route must use a different strategic or visual mechanism
+(for example, field note, proof demo, myth correction, or decision aid), name
+its audience tension and proof IDs, and specify exactly one distinctive move.
+Changing only color, font, synonym, or decoration is not a new route. Record
+the selected route and human decision before creating or mutating a Canva
+design.
+
+Carry one art direction per selected route. It should name the visual premise,
+the one distinctive move, the rationale, and a semantic role for every
+ornament. Keep copy, logos, icons, CTA, and essential layout as editable
+elements. Bind the approved template/version, folder, Brand Controls snapshot,
+locked elements, and editable slots to the same tenant/client/product/brand
+scope.
+
+The deterministic audit reports explainable findings such as
+`generic_language`, `same_layout_cluster`, `decorative_filler`,
+`ocr_mismatch`, `layout_collision`, `semantic_mismatch`, `wcag_contrast`, or
+`rights_unresolved`. It stores five 0–5 slop dimensions and a 100-point
+rubric; it never stores an AI-authorship probability. Final QA needs OCR exact
+match, layout/overflow checks, semantic object/count/relation checks, WCAG
+contrast and alt text, rights/provenance, recent-fingerprint similarity,
+independent critique, and a scoped approval-package checksum.
+
 ## Information architecture
 
 For a carousel, use this default only when it fits the idea:

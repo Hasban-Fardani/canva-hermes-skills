@@ -13,22 +13,38 @@ credentials, generated campaign content, export receipts, or runtime state.
 
 ## Cara kerja
 
-Alur utama memisahkan penyusunan aturan brand, produksi konten, persetujuan,
-dan publikasi opsional:
+Alur produksi memisahkan keputusan editorial dari mutasi Canva. Prompt-only
+generation berguna untuk eksplorasi, tetapi bukan jalur produksi: copy, logo,
+icon, layout, dan CTA tetap harus editable dan terstruktur.
 
 ```mermaid
 flowchart LR
-  A[Brief + scope] --> B[Brand copy<br/>capture + validate]
-  B --> C[Validated Brand Bundle]
-  C --> D[Objective + pillar<br/>copy + content spec + QA]
-  D --> E[Canva via MCP<br/>capability · template · folder<br/>draft · preview]
-  E --> F{Approve?}
-  F -- Revisi --> D
-  F -- Setuju --> G[Export + download<br/>checksum + receipt]
-  G --> H{Publish?}
-  H -- Tidak --> I[Handoff selesai]
-  H -- Ya --> J[Separate publishing<br/>branch + scoped policy]
+  A[Scoped source packet] --> B[Brief with tension<br/>+ content contract]
+  B --> C[3–5 genuinely different<br/>route cards]
+  C --> D{Human selects route}
+  D --> E[Art direction<br/>+ one distinctive move]
+  E --> F[Approved Canva template<br/>folder + controls]
+  F --> G[Editable production<br/>and render]
+  G --> H[Deterministic QA<br/>OCR · layout · semantic · WCAG · rights]
+  H --> I{Human approval}
+  I -- Revise --> E
+  I -- Approve --> J[Export + download<br/>checksum + receipt]
+  J --> K{Publish?}
+  K -- No --> L[Handoff complete]
+  K -- Yes --> M[Separate authorized<br/>publishing action]
+  M --> N[Scoped runtime feedback,<br/>fingerprints, and measurement]
 ```
+
+The route set must differ in strategic idea, narrative order, visual premise, or
+asset plan; changing only a color, font, or synonym is not divergence. Run
+copy/claim and anti-pattern review before Canva, inspect every rendered page
+with deterministic checks, and keep visual critique and final approval human-led.
+Store rejection reasons, provenance, approval records, checksums, and recent
+content fingerprints only in tenant/client/product/brand-scoped runtime data.
+
+Measure separate layers: human quality, production efficiency, audience
+response, business outcomes, and risk. A slop index or detector score is
+diagnostic telemetry, never an authorship label or a substitute for review.
 
 Repositori ini adalah lapisan instruksi dan validasi; data runtime tetap berada
 di luar repositori. Persetujuan berjalan approval-first secara default, sedangkan
@@ -187,6 +203,28 @@ The release checker enforces the public-safe allowlist, scans for local paths an
 likely secrets, rejects runtime-looking JSON, and accepts additional private
 markers only through test-only command-line arguments or the
 `HERMES_RELEASE_MARKERS` environment variable. It never prints marker values.
+
+## Install and contribution workflow
+
+Install `brand-copy-studio` first, then `social-content-studio`, so the social
+route can call the sibling brand validator before privileged approval or export.
+For a repository change, use a branch, run the tests and release checker above,
+then inspect the staged paths before committing:
+
+```bash
+git switch -c <change-name>
+git diff --check
+python3 scripts/check_public_release.py
+git add README.md GUIDE.md SECURITY.md .gitignore scripts/check_public_release.py .github/workflows/quality.yml
+git diff --cached --check
+git diff --cached --name-only
+git commit -m "docs: document production quality flow"
+```
+
+Only generic documentation, allowlisted skill files, validators, tests, and CI
+belong in a commit. Brand evidence, generated content, runtime feedback,
+fingerprints, approvals, measurements, exports, and receipts stay outside the
+repository even when a local workflow uses them.
 
 ## Privacy
 

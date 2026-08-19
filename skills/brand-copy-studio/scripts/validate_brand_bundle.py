@@ -11,7 +11,9 @@ rights, reference, revision, and secret-handling mistakes. It does not decide
     external local access-policy object supplied through ``policy`` or ``--policy``
     and a trusted runtime actor identity supplied through ``actor_id`` or
     ``--actor-id``; mutable authorization fields inside the bundle are audit
-    receipts only.
+    receipts only. Privileged states also require the evidence-backed anti-slop
+    creative contract in ``brand-profile.json``; this is an explainable schema
+    gate, never an AI-authorship detector.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import datetime as dt
 import json
 import re
 import sys
+from dataclasses import dataclass
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -61,6 +65,56 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
 )
+
+
+@dataclass(frozen=True)
+class TrustedAccessPolicyContext:
+    """Immutable, out-of-band policy capability for privileged validation."""
+
+    _value: dict[str, Any]
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "TrustedAccessPolicyContext":
+        return cls(deepcopy(value))
+
+    @classmethod
+    def from_file(cls, value: str | Path) -> "TrustedAccessPolicyContext":
+        path = _path(value)
+        return cls(json.loads(path.read_text(encoding="utf-8")))
+
+    def as_mapping(self) -> dict[str, Any]:
+        return deepcopy(self._value)
+ANTI_SLOP_LIST_FIELDS = (
+    "audience_situations",
+    "human_proof_points",
+    "distinctive_assets",
+    "visual_principles",
+    "composition_rules",
+    "avoid_patterns",
+)
+ANTI_SLOP_REQUIRED_FIELDS = (
+    *ANTI_SLOP_LIST_FIELDS,
+    "strategic_tension",
+    "voice_examples",
+    "model_usage_policy",
+    "approval_roles",
+    "feedback_reason_codes",
+)
+ANTI_SLOP_TEXT_ALIASES = {
+    "audience_situations": ("situation", "value", "description"),
+    "human_proof_points": ("proof", "proof_point", "value", "description"),
+    "distinctive_assets": ("asset", "name", "value", "description"),
+    "visual_principles": ("principle", "value", "description"),
+    "composition_rules": ("rule", "value", "description"),
+    "avoid_patterns": ("pattern", "value", "description"),
+}
+ANTI_SLOP_REASON_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+ANTI_SLOP_APPROVAL_ROLES = {"lead", "admin", "reviewer", "publisher"}
+ANTI_SLOP_POLICY_ALIASES = {
+    "allowed": ("allowed", "allowed_uses", "allowed_roles", "allowed_ai_roles"),
+    "restricted": ("restricted", "restricted_uses", "restricted_roles", "restricted_ai_roles"),
+    "prohibited": ("prohibited", "prohibited_uses", "prohibited_roles", "prohibited_ai_roles"),
+}
 
 
 def _path(path: str | Path) -> Path:
@@ -142,6 +196,344 @@ def _validate_approved_record(record: dict[str, Any], location: str, errors: lis
     rights = _validate_rights(record.get("rights"), f"{location}.rights", errors, required=True)
     if rights is not None and rights.get("status") not in APPROVED_RIGHTS:
         errors.append(f"{location}: approved record requires rights.status approved or exact")
+
+
+def _anti_slop_fields(profile: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    """Return the anti-slop contract, accepting a nested draft alias.
+
+    The canonical representation is top-level on ``brand-profile.json`` so
+    older consumers can ignore the additive fields.  A nested ``anti_slop``
+    object is accepted for forward-compatible handoffs, but conflicting values
+    are always rejected rather than choosing one silently.
+    """
+
+    nested = profile.get("anti_slop")
+    if nested is not None and not isinstance(nested, dict):
+        errors.append("brand-profile.json.anti_slop: must be an object")
+        nested = {}
+    values: dict[str, Any] = {}
+    for field in ANTI_SLOP_REQUIRED_FIELDS:
+        direct_present = field in profile
+        nested_present = isinstance(nested, dict) and field in nested
+        if direct_present and nested_present and profile[field] != nested[field]:
+            errors.append(f"brand-profile.json.{field}: conflicts with brand-profile.json.anti_slop.{field}")
+        if direct_present:
+            values[field] = profile[field]
+        elif nested_present:
+            values[field] = nested[field]
+    # Accept the descriptive split names used by older handoff notes while
+    # emitting/using the canonical ``voice_examples`` object internally.
+    if "voice_examples" not in values:
+        positive_keys = ("positive_voice_examples", "voice_positive_examples")
+        negative_keys = ("negative_voice_examples", "voice_negative_examples")
+        positive = next((profile[key] for key in positive_keys if key in profile), None)
+        negative = next((profile[key] for key in negative_keys if key in profile), None)
+        if isinstance(nested, dict):
+            positive = next((nested[key] for key in positive_keys if key in nested), positive)
+            negative = next((nested[key] for key in negative_keys if key in nested), negative)
+        if positive is not None or negative is not None:
+            values["voice_examples"] = {"positive": positive or [], "negative": negative or []}
+    aliases = {
+        "distinctive_assets": ("distinctive_brand_assets",),
+        "composition_rules": ("composition", "composition_principles"),
+        "avoid_patterns": ("visual_avoid_patterns",),
+    }
+    for field, names in aliases.items():
+        if field in values:
+            continue
+        alias_value = next((profile[name] for name in names if name in profile), None)
+        if isinstance(nested, dict):
+            alias_value = next((nested[name] for name in names if name in nested), alias_value)
+        if alias_value is not None:
+            values[field] = alias_value
+    return values
+
+
+def _validate_evidence_text_record(
+    record: Any,
+    location: str,
+    aliases: tuple[str, ...],
+    record_locations: dict[str, str],
+    privileged: bool,
+    errors: list[str],
+) -> bool:
+    """Validate one anti-slop evidence item and collect its stable ID."""
+
+    if not isinstance(record, dict):
+        errors.append(f"{location}: must be an object")
+        return False
+    _collect_record_id(record, location, record_locations, errors)
+    _require_fields(record, ("id", "evidence_status", "source_ids"), location, errors)
+    if not any(_is_nonempty_string(record.get(alias)) for alias in aliases):
+        errors.append(f"{location}: requires a non-empty value ({', '.join(aliases)})")
+    _validate_evidence_record(record, location, errors)
+    if privileged and record.get("evidence_status") not in APPROVED_EVIDENCE:
+        errors.append(f"{location}: privileged anti-slop evidence requires exact or observed status")
+    source_ids = record.get("source_ids")
+    if privileged and isinstance(source_ids, list) and not source_ids:
+        errors.append(f"{location}: privileged anti-slop evidence requires non-empty source_ids")
+    return True
+
+
+def _validate_record_scope(value: Any, location: str, expected_scope: tuple[Any, ...] | None, errors: list[str]) -> None:
+    """Validate optional record scope without allowing cross-tenant assets."""
+
+    if value is None:
+        return
+    if not isinstance(value, dict) or not isinstance(expected_scope, tuple) or len(expected_scope) < 4:
+        errors.append(f"{location}: scope must be an object matching bundle scope")
+        return
+    actual = (
+        value.get("brand_id"),
+        value.get("tenant_id"),
+        value.get("client_id"),
+        value.get("product_id") or "",
+    )
+    if actual != expected_scope[:4]:
+        errors.append(f"{location}: does not match bundle scope")
+
+
+def _validate_anti_slop_policy(value: Any, location: str, privileged: bool, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{location}: must be an object")
+        return
+    for concept, aliases in ANTI_SLOP_POLICY_ALIASES.items():
+        present = next((alias for alias in aliases if alias in value), None)
+        if present is None:
+            errors.append(f"{location}: missing {concept!r} uses")
+            continue
+        items = value[present]
+        if not isinstance(items, list):
+            errors.append(f"{location}.{present}: must be an array")
+            continue
+        for index, item in enumerate(items):
+            if not _is_nonempty_string(item):
+                errors.append(f"{location}.{present}[{index}]: must be a non-empty string")
+
+    human_required = value.get("human_approval_required", value.get("requires_human_approval"))
+    if not isinstance(human_required, bool):
+        errors.append(f"{location}.human_approval_required: must be boolean")
+    elif privileged and human_required is not True:
+        errors.append(f"{location}.human_approval_required: must be true for privileged states")
+
+    approval_required = value.get("approval_required_for", value.get("human_approval_for"))
+    if not isinstance(approval_required, list):
+        errors.append(f"{location}.approval_required_for: must be an array")
+    else:
+        for index, item in enumerate(approval_required):
+            if not _is_nonempty_string(item):
+                errors.append(f"{location}.approval_required_for[{index}]: must be a non-empty string")
+        if privileged and not approval_required:
+            errors.append(f"{location}.approval_required_for: must not be empty for privileged states")
+
+    groups: dict[str, set[str]] = {}
+    for concept, aliases in ANTI_SLOP_POLICY_ALIASES.items():
+        present = next((alias for alias in aliases if alias in value), None)
+        if present and isinstance(value[present], list):
+            groups[concept] = {item.casefold() for item in value[present] if isinstance(item, str)}
+    if groups.get("allowed", set()) & groups.get("prohibited", set()):
+        errors.append(f"{location}: allowed and prohibited model uses must be disjoint")
+    if groups.get("restricted", set()) & groups.get("prohibited", set()):
+        errors.append(f"{location}: restricted and prohibited model uses must be disjoint")
+    if privileged:
+        delegated_uses = groups.get("allowed", set()) | groups.get("restricted", set())
+        forbidden_fragments = ("approv", "activat", "publish", "signoff", "finalize", "rightsclear", "claimapproval")
+        if any(any(fragment in use.replace("_", "").replace("-", "") for fragment in forbidden_fragments) for use in delegated_uses):
+            errors.append(f"{location}: model policy cannot delegate approval, activation, publishing, or rights clearance")
+
+
+def _validate_approval_roles(value: Any, location: str, privileged: bool, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{location}: must be an object")
+        return
+    required = ("copy", "claims", "design", "publish")
+    for field in required:
+        roles = value.get(field)
+        if not isinstance(roles, list):
+            errors.append(f"{location}.{field}: must be an array")
+            continue
+        for index, role in enumerate(roles):
+            if role not in ANTI_SLOP_APPROVAL_ROLES:
+                errors.append(f"{location}.{field}[{index}]: invalid approval role {role!r}")
+        if privileged and not roles:
+            errors.append(f"{location}.{field}: must not be empty for privileged states")
+    unknown = sorted(set(value) - set(required))
+    if unknown:
+        errors.append(f"{location}: unknown field(s) {unknown!r}")
+
+
+def _validate_feedback_reason_codes(
+    value: Any,
+    location: str,
+    expected_scope: tuple[Any, ...] | None,
+    privileged: bool,
+    errors: list[str],
+) -> None:
+    """Validate generic feedback taxonomy while binding it to one scope."""
+
+    if isinstance(value, list):
+        # Compatibility form: each code carries its own scope.
+        codes = value
+        container_scope = None
+    elif isinstance(value, dict):
+        codes = value.get("codes")
+        container_scope = value.get("scope")
+        if not isinstance(container_scope, dict):
+            errors.append(f"{location}.scope: must be an object")
+        unknown = sorted(set(value) - {"scope", "codes"})
+        if unknown:
+            errors.append(f"{location}: unknown field(s) {unknown!r}")
+    else:
+        errors.append(f"{location}: must be an object or array")
+        return
+
+    if not isinstance(codes, list):
+        errors.append(f"{location}.codes: must be an array")
+        return
+    if privileged and not codes:
+        errors.append(f"{location}.codes: must not be empty for privileged states")
+
+    def scope_matches(scope: Any) -> bool:
+        # Legacy and ordinary drafts may carry a placeholder taxonomy while
+        # scope is still being established. Exact equality is a privileged
+        # activation/approval gate, where accepting a mismatch would be unsafe.
+        if not privileged:
+            return True
+        if not isinstance(scope, dict) or not isinstance(expected_scope, tuple) or len(expected_scope) < 4:
+            return False
+        return (
+            scope.get("brand_id"),
+            scope.get("tenant_id"),
+            scope.get("client_id"),
+            scope.get("product_id") or "",
+        ) == expected_scope[:4]
+
+    if container_scope is not None and not scope_matches(container_scope):
+        errors.append(f"{location}.scope: does not match bundle scope")
+    for index, code in enumerate(codes):
+        code_location = f"{location}.codes[{index}]"
+        if not isinstance(code, dict):
+            errors.append(f"{code_location}: must be an object")
+            continue
+        _require_fields(code, ("code", "dimension", "description"), code_location, errors)
+        reason_code = code.get("code")
+        if not _is_nonempty_string(reason_code) or not ANTI_SLOP_REASON_CODE_PATTERN.fullmatch(reason_code):
+            errors.append(f"{code_location}.code: must match uppercase reason-code format")
+        for field in ("dimension", "description"):
+            if not _is_nonempty_string(code.get(field)):
+                errors.append(f"{code_location}.{field}: must be a non-empty string")
+        if container_scope is None and not scope_matches(code.get("scope")):
+            errors.append(f"{code_location}.scope: does not match bundle scope")
+
+
+def _validate_anti_slop_contract(
+    profile: dict[str, Any],
+    record_locations: dict[str, str],
+    expected_scope: tuple[Any, ...] | None,
+    privileged: bool,
+    errors: list[str],
+) -> list[tuple[str, list[str]]]:
+    """Validate additive anti-slop fields and return evidence source refs."""
+
+    fields = _anti_slop_fields(profile, errors)
+    source_refs: list[tuple[str, list[str]]] = []
+    if not fields:
+        if privileged:
+            errors.append("brand-profile.json: anti-slop contract is required for privileged states")
+        return source_refs
+
+    for field in ANTI_SLOP_LIST_FIELDS:
+        if field not in fields:
+            if privileged:
+                errors.append(f"brand-profile.json.{field}: required for privileged states")
+            continue
+        records = fields[field]
+        location = f"brand-profile.json.{field}"
+        if not isinstance(records, list):
+            errors.append(f"{location}: must be an array")
+            continue
+        if privileged and not records:
+            errors.append(f"{location}: must not be empty for privileged states")
+        for index, record in enumerate(records):
+            item_location = f"{location}[{index}]"
+            valid = _validate_evidence_text_record(
+                record,
+                item_location,
+                ANTI_SLOP_TEXT_ALIASES[field],
+                record_locations,
+                privileged,
+                errors,
+            )
+            if valid and isinstance(record, dict):
+                source_refs.append((item_location, _validate_string_list(record.get("source_ids"), f"{item_location}.source_ids", errors)))
+                _validate_record_scope(record.get("scope"), f"{item_location}.scope", expected_scope, errors)
+            if field == "distinctive_assets" and isinstance(record, dict):
+                if not _is_nonempty_string(record.get("role")):
+                    errors.append(f"{item_location}.role: must be a non-empty semantic role")
+                rights = _validate_rights(record.get("rights"), f"{item_location}.rights", errors, required=True)
+                if privileged and rights is not None and rights.get("status") not in APPROVED_RIGHTS:
+                    errors.append(f"{item_location}: distinctive asset rights must be approved or exact for privileged states")
+
+    tension = fields.get("strategic_tension")
+    if tension is None:
+        if privileged:
+            errors.append("brand-profile.json.strategic_tension: required for privileged states")
+    else:
+        valid = _validate_evidence_text_record(
+            tension,
+            "brand-profile.json.strategic_tension",
+            ("tension", "value", "description"),
+            record_locations,
+            privileged,
+            errors,
+        )
+        if valid and isinstance(tension, dict):
+            source_refs.append(("brand-profile.json.strategic_tension", _validate_string_list(tension.get("source_ids"), "brand-profile.json.strategic_tension.source_ids", errors)))
+            _validate_record_scope(tension.get("scope"), "brand-profile.json.strategic_tension.scope", expected_scope, errors)
+
+    voice_examples = fields.get("voice_examples")
+    if voice_examples is None:
+        if privileged:
+            errors.append("brand-profile.json.voice_examples: required for privileged states")
+    elif not isinstance(voice_examples, dict):
+        errors.append("brand-profile.json.voice_examples: must be an object")
+    else:
+        unknown = sorted(set(voice_examples) - {"positive", "negative"})
+        if unknown:
+            errors.append(f"brand-profile.json.voice_examples: unknown field(s) {unknown!r}")
+        for polarity in ("positive", "negative"):
+            examples = voice_examples.get(polarity)
+            location = f"brand-profile.json.voice_examples.{polarity}"
+            if not isinstance(examples, list):
+                errors.append(f"{location}: must be an array")
+                continue
+            if privileged and not examples:
+                errors.append(f"{location}: must not be empty for privileged states")
+            for index, record in enumerate(examples):
+                item_location = f"{location}[{index}]"
+                if _validate_evidence_text_record(record, item_location, ("example", "value", "text", "description"), record_locations, privileged, errors) and isinstance(record, dict):
+                    source_refs.append((item_location, _validate_string_list(record.get("source_ids"), f"{item_location}.source_ids", errors)))
+                    _validate_record_scope(record.get("scope"), f"{item_location}.scope", expected_scope, errors)
+
+    policy = fields.get("model_usage_policy")
+    if policy is None and privileged:
+        errors.append("brand-profile.json.model_usage_policy: required for privileged states")
+    elif policy is not None:
+        _validate_anti_slop_policy(policy, "brand-profile.json.model_usage_policy", privileged, errors)
+
+    roles = fields.get("approval_roles")
+    if roles is None and privileged:
+        errors.append("brand-profile.json.approval_roles: required for privileged states")
+    elif roles is not None:
+        _validate_approval_roles(roles, "brand-profile.json.approval_roles", privileged, errors)
+
+    feedback = fields.get("feedback_reason_codes")
+    if feedback is None and privileged:
+        errors.append("brand-profile.json.feedback_reason_codes: required for privileged states")
+    elif feedback is not None:
+        _validate_feedback_reason_codes(feedback, "brand-profile.json.feedback_reason_codes", expected_scope, privileged, errors)
+
+    return source_refs
 
 
 def _load_json(path: Path, errors: list[str]) -> dict[str, Any] | None:
@@ -232,14 +624,18 @@ def _validate_revision(value: Any, location: str, errors: list[str], required: b
     return True
 
 
-def _load_policy(value: dict[str, Any] | str | Path | None, errors: list[str]) -> dict[str, Any] | None:
+def _load_policy(value: TrustedAccessPolicyContext | dict[str, Any] | str | Path | None, errors: list[str]) -> dict[str, Any] | None:
     """Load a trusted local policy object supplied out-of-band by the caller."""
 
     if value is None:
         return None
+    if isinstance(value, TrustedAccessPolicyContext):
+        policy = value.as_mapping()
+        _record_errors(policy, "policy", errors)
+        return policy
     if isinstance(value, dict):
-        _record_errors(value, "policy", errors)
-        return value
+        errors.append("policy: raw mappings are not accepted; load a TrustedAccessPolicyContext from an external file")
+        return None
     if isinstance(value, (str, Path)):
         path = _path(value)
         try:
@@ -453,7 +849,7 @@ def validate_brand_bundle(
     directory: str | Path,
     expected_brand_id: str | None = None,
     expected_scope: dict[str, Any] | None = None,
-    policy: dict[str, Any] | str | Path | None = None,
+    policy: TrustedAccessPolicyContext | dict[str, Any] | str | Path | None = None,
     actor_id: str | None = None,
 ) -> list[str]:
     """Return deterministic validation errors; an empty list means valid."""
@@ -475,13 +871,14 @@ def validate_brand_bundle(
     external_policy = _validate_policy(_load_policy(policy, errors), errors)
 
     envelope: tuple[str, ...] = ("schema_version", "brand_id", "revision", "status")
-    schema_versions: set[Any] = set()
+    schema_versions: list[Any] = []
     scope_values: dict[str, tuple[Any, ...]] = {}
     for filename, document in docs.items():
         _require_fields(document, envelope, filename, errors)
         schema_version = document.get("schema_version")
-        schema_versions.add(schema_version)
-        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        if not any(existing == schema_version for existing in schema_versions):
+            schema_versions.append(schema_version)
+        if not isinstance(schema_version, str) or schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             errors.append(f"{filename}.schema_version: expected '1.0' or '1.1'")
         scope_values[filename] = _validate_scope(document, filename, schema_version, errors)
         revision = document.get("revision")
@@ -558,6 +955,7 @@ def validate_brand_bundle(
         if record.get("status") not in ALLOWED_CLAIM_STATUS:
             errors.append(f"{location}.status: invalid value {record.get('status')!r}")
         _validate_rights(record.get("rights"), f"{location}.rights", errors)
+        _validate_record_scope(record.get("scope"), f"{location}.scope", common_scope, errors)
         _validate_approved_record(record, location, errors)
 
     templates = docs["template-registry.json"].get("templates")
@@ -596,6 +994,7 @@ def validate_brand_bundle(
         claim_refs = _validate_string_list(record.get("claim_ids"), f"{location}.claim_ids", errors)
         template_claim_refs.append((location, claim_refs))
         _validate_rights(record.get("rights"), f"{location}.rights", errors)
+        _validate_record_scope(record.get("scope"), f"{location}.scope", common_scope, errors)
         _validate_approved_record(record, location, errors)
 
     provenance = docs["provenance.json"]
@@ -625,6 +1024,7 @@ def validate_brand_bundle(
             if not _is_nonempty_string(source.get(field)):
                 errors.append(f"{location}.{field}: must be a non-empty string")
         _validate_rights(source.get("authorization"), f"{location}.authorization", errors, required=True)
+        _validate_record_scope(source.get("scope"), f"{location}.scope", common_scope, errors)
 
     ledger_record_refs: list[tuple[str, str | None, list[str]]] = []
     for index, entry in enumerate(evidence_ledger):
@@ -651,6 +1051,11 @@ def validate_brand_bundle(
             errors.append("provenance.json.update.operation: must be a non-empty string")
 
     source_ids = set(source_locations)
+    source_authorization_status = {
+        source.get("source_id"): (source.get("authorization") or {}).get("status")
+        for source in sources
+        if isinstance(source, dict)
+    }
     profile_source_refs: list[tuple[str, list[str]]] = []
     for field in ("voice", "terminology", "copy_constraints", "visual_copy_cues", "gaps"):
         records = profile.get(field, [])
@@ -658,12 +1063,33 @@ def validate_brand_bundle(
             for index, record in enumerate(records):
                 if isinstance(record, dict):
                     profile_source_refs.append((f"brand-profile.json.{field}[{index}]", _validate_string_list(record.get("source_ids"), f"brand-profile.json.{field}[{index}].source_ids", errors)))
+    approved_registry_records = [
+        (registry_name, index, record)
+        for registry_name, records in (
+            ("claim-registry.json", claims),
+            ("template-registry.json", templates),
+        )
+        for index, record in enumerate(records)
+        if isinstance(record, dict) and record.get("status") == "approved"
+    ]
+    needs_privileged_authority = common["status"] == "active" or bool(approved_registry_records)
+    profile_source_refs.extend(
+        _validate_anti_slop_contract(
+            profile,
+            record_locations,
+            common_scope,
+            needs_privileged_authority,
+            errors,
+        )
+    )
     claim_source_refs = [(f"claim-registry.json.claims[{index}]", _validate_string_list(record.get("source_ids"), f"claim-registry.json.claims[{index}].source_ids", errors)) for index, record in enumerate(claims) if isinstance(record, dict)]
     template_source_refs = [(f"template-registry.json.templates[{index}]", _validate_string_list(record.get("source_ids"), f"template-registry.json.templates[{index}].source_ids", errors)) for index, record in enumerate(templates) if isinstance(record, dict)]
     for location, refs in profile_source_refs + claim_source_refs + template_source_refs:
         for source_id in refs:
             if source_id not in source_ids:
                 errors.append(f"{location}.source_ids: unknown source ID {source_id!r}")
+            elif needs_privileged_authority and source_authorization_status.get(source_id) not in APPROVED_RIGHTS:
+                errors.append(f"{location}.source_ids: privileged evidence requires authorized source {source_id!r}")
     for location, record_id, refs in ledger_record_refs:
         if record_id is not None and record_id not in record_locations:
             errors.append(f"{location}.record_id: unknown record ID {record_id!r}")
@@ -704,6 +1130,28 @@ def validate_brand_bundle(
             for index, record in enumerate(templates)
             if isinstance(record, dict)
         )
+        anti_slop_fields = _anti_slop_fields(profile, errors)
+        for field in ANTI_SLOP_LIST_FIELDS:
+            records = anti_slop_fields.get(field, [])
+            if isinstance(records, list):
+                observed_records.extend(
+                    (f"brand-profile.json.{field}[{index}]", record)
+                    for index, record in enumerate(records)
+                    if isinstance(record, dict)
+                )
+        tension = anti_slop_fields.get("strategic_tension")
+        if isinstance(tension, dict):
+            observed_records.append(("brand-profile.json.strategic_tension", tension))
+        voice_examples = anti_slop_fields.get("voice_examples")
+        if isinstance(voice_examples, dict):
+            for polarity in ("positive", "negative"):
+                records = voice_examples.get(polarity, [])
+                if isinstance(records, list):
+                    observed_records.extend(
+                        (f"brand-profile.json.voice_examples.{polarity}[{index}]", record)
+                        for index, record in enumerate(records)
+                        if isinstance(record, dict)
+                    )
         for location, record in observed_records:
             if record.get("evidence_status") == "exact":
                 errors.append(f"{location}: observe operation requires observed, inferred, or unverified evidence")
@@ -713,16 +1161,6 @@ def validate_brand_bundle(
             if isinstance(rights, dict) and rights.get("status") in APPROVED_RIGHTS:
                 errors.append(f"{location}: observe operation cannot clear rights before owner approval")
 
-    approved_registry_records = [
-        (registry_name, index, record)
-        for registry_name, records, field_name in (
-            ("claim-registry.json", claims, "claims"),
-            ("template-registry.json", templates, "templates"),
-        )
-        for index, record in enumerate(records)
-        if isinstance(record, dict) and record.get("status") == "approved"
-    ]
-    needs_privileged_authority = common["status"] == "active" or bool(approved_registry_records)
     authority_ok = True
     if needs_privileged_authority:
         authority_ok = _validate_privileged_authority(

@@ -7,6 +7,12 @@ access-policy object separately, using the validator library's `policy` argument
 or CLI `--policy <path>` option, plus the trusted current runtime identity via
 the library's `actor_id` argument or CLI `--actor-id` option.
 
+Library callers must pass a `TrustedAccessPolicyContext` created from an
+external policy file. Raw or deep-copied dictionaries are rejected for
+privileged validation, preventing bundle or prompt data from being mistaken
+for trusted authority. The CLI `--policy` path remains the supported external
+loader; draft validation remains compatible without a policy context.
+
 Start from [assets/access-policy.template.json](../assets/access-policy.template.json).
 The policy is provider-neutral and contains no real users:
 
@@ -56,3 +62,9 @@ Draft and `observe` validation does not require a policy or runtime actor.
 `observe` remains a non-active, unverified draft; later capture/refresh and
 activation require the external policy, trusted runtime actor, and authoritative
 source or owner approval.
+
+For an active bundle or any approved claim/template, the brand profile's
+anti-slop contract is privileged state as well: the model-use policy must make
+human approval mandatory, all four approval-role lists must be populated, and
+feedback reason codes must carry the exact tenant/client/brand/product scope.
+The external policy still supplies the authority; profile text cannot grant it.

@@ -89,6 +89,41 @@ values small and structured. Each rule should include `id`, `value`,
 `evidence_status`, and `source_ids`; examples in the template are empty arrays,
 not defaults.
 
+### Anti-slop creative contract
+
+The profile may add the following top-level fields. They are deliberately
+provider-neutral and additive, so schema `1.0` readers can ignore them and
+legacy drafts remain readable:
+
+- `audience_situations`: concrete audience circumstances or questions;
+- `strategic_tension`: the meaningful problem, trade-off, or change behind the
+  brief;
+- `human_proof_points`: supplied observations, examples, artifacts, quotes, or
+  other reasons to believe;
+- `voice_examples.positive` and `voice_examples.negative`: examples of the
+  desired voice and patterns to avoid;
+- `distinctive_assets`: recognizable assets with a semantic role and rights
+  record; palette alone is not a distinctive asset;
+- `visual_principles`, `composition_rules`, and `avoid_patterns`: visual
+  invariants, intentional composition choices, and anti-patterns;
+- `model_usage_policy`: `allowed`, `restricted`, and `prohibited` model uses,
+  plus `human_approval_required` and `approval_required_for`;
+- `approval_roles`: non-empty `copy`, `claims`, `design`, and `publish` role
+  lists for privileged bundles; values are `lead`, `admin`, `reviewer`, or
+  `publisher`;
+- `feedback_reason_codes`: an object containing the exact bundle scope and a
+  `codes` array of stable uppercase reason codes, dimensions, and descriptions.
+
+Each creative-contract record carries `id`, a non-empty text/value field,
+`evidence_status`, and `source_ids`. A distinctive asset additionally requires
+`role` and `rights`. Drafts may leave these arrays empty while collecting
+evidence. An `active` bundle, or any bundle containing an `approved` claim or
+template, must provide every field, at least one item in every required list,
+evidenced proof and voice examples, rights-cleared distinctive assets, a
+scope-matching feedback taxonomy, and a model policy that makes human approval
+mandatory. Missing or unknown values fail closed. This contract reports
+explainable editorial evidence; it is not an AI-authorship detector or score.
+
 ## `claim-registry.json`
 
 `claims` is an array of records with `id`, `claim`, `claim_type`, `status`,

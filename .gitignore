@@ -20,6 +20,12 @@ receipts/
 cache/
 caches/
 
+# Anti-slop runtime state (never part of a release)
+feedback/
+fingerprints/
+approvals/
+measurements/
+
 # Editor and OS files
 .DS_Store
 .idea/

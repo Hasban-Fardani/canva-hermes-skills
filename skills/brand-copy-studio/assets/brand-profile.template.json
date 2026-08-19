@@ -15,6 +15,39 @@
   "terminology": [],
   "copy_constraints": [],
   "visual_copy_cues": [],
+  "audience_situations": [],
+  "strategic_tension": null,
+  "human_proof_points": [],
+  "voice_examples": {
+    "positive": [],
+    "negative": []
+  },
+  "distinctive_assets": [],
+  "visual_principles": [],
+  "composition_rules": [],
+  "avoid_patterns": [],
+  "model_usage_policy": {
+    "allowed": [],
+    "restricted": [],
+    "prohibited": [],
+    "human_approval_required": true,
+    "approval_required_for": []
+  },
+  "approval_roles": {
+    "copy": [],
+    "claims": [],
+    "design": [],
+    "publish": []
+  },
+  "feedback_reason_codes": {
+    "scope": {
+      "tenant_id": "",
+      "client_id": "",
+      "brand_id": "",
+      "product_id": null
+    },
+    "codes": []
+  },
   "rights": {
     "owner": "",
     "authorization_scope": "",

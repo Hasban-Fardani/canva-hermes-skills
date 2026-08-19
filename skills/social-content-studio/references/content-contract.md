@@ -3,6 +3,99 @@
 Use one JSON record per publishable content unit. The validator script is the
 normative executable contract; this document explains its fields and workflow.
 
+## Anti-slop production contract
+
+Anti-slop is an explainable editorial and production quality gate. It is not an
+authorship label and this contract deliberately has no AI probability,
+detector score, or human-likeness field. A record may use the additive fields
+below while it is an early draft. Canva mutation, `HUMAN_APPROVED`, export,
+scheduling, and publishing fail closed unless these fields are complete and
+their evidence passes.
+
+### Source packet and creative brief
+
+`source_packet` is scoped to the full `tenant_id + client_id + product_id +
+brand_id` tuple and records `objective`, `audience_situation`, a concrete
+`observation`, `proof_ids`, allowed/forbidden assets or claims, source
+locators, retrieval time, and recent scoped fingerprints. Its
+`recent_fingerprints` object records the observation `window`, hooks, CTAs,
+layout families, motifs/phrases, and deterministic `similarity_checks` with a
+candidate ID, score from 0–1, and status.
+
+`creative_brief` turns the packet into an editorial decision: audience
+situation, tension, takeaway, proof IDs, point of view, desired action, and
+forbidden claims. Do not treat generic category knowledge as brand evidence.
+
+### Route cards and human selection
+
+`route_set.routes` contains three to five route cards before any Canva write.
+Each route has a stable `route_id`, strategic idea, audience tension, message
+promise, proof IDs, visual premise, narrative order, asset plan, exactly one
+`distinctive_move`, risk, and `why_different_from_recent_posts`. Routes must
+differ in at least two strategic/visual axes; palette, font, or synonym changes
+do not count. `human_selected_route` must reference one route and record the
+human actor, timestamp, decision, scope, and rationale before a Canva reference
+or final lifecycle state exists.
+
+`art_direction` repeats the selected route ID, gives an observable visual
+premise and rationale, and carries exactly one distinctive move. Every
+decorative element needs a `semantic_role` and rationale. Essential copy,
+logos, icons, CTA, and layout remain editable and structured.
+
+### Canva production controls
+
+`production_controls` is a scoped snapshot of the approved local template
+alias/version and exact provider template ID, approved folder ID, and approved
+Canva Brand Controls snapshot. The Brand Controls snapshot records revision,
+locked elements, and editable slots. `design.folder_id`, when present, must
+match the snapshot. A name or search result is not approval; scope, status,
+approver, and revision must resolve through `template_registry`.
+
+Each slide additionally records `page_role`, `visual_role`, and `proof_ids`.
+Proof IDs resolve to the scoped source packet. The existing `role` and
+`visual_direction` fields remain valid aliases for early drafts.
+
+### Audit, evidence, and blockers
+
+`anti_slop_audit` records `status`, explainable `reason_codes` and findings,
+five `slop_index` dimensions scored 0–5 (`generic_language`,
+`visual_convergence`, `decorative_filler`, `evidence_gap`, and `process_debt`),
+and a weighted 100-point rubric:
+
+| Dimension | Points |
+|---|---:|
+| Brief and communication fit | 20 |
+| Distinctive idea | 20 |
+| Brand expression | 15 |
+| Hierarchy and readability | 15 |
+| Copy clarity and evidence | 15 |
+| Craft and consistency | 10 |
+| Channel and accessibility | 5 |
+
+The audit evidence keys are `ocr`, `layout`, `semantic`, `wcag`, `rights`, and
+`recent_similarity`. OCR must record exact match; layout must record no
+overflow/collision; semantic evidence covers object/count/color/relation/CTA
+contracts; WCAG evidence records contrast; and rights evidence records asset
+provenance/permission. `independent_critique` must identify a separate
+reviewer and findings. `hard_blockers` include scope, claim/evidence, rights,
+OCR, layout, semantic, WCAG, template controls, and approval-package checks.
+Any failed or pending blocker rejects a Canva mutation or final state.
+
+`anti_slop_audit.approval_package` binds full scope, content ID, render digest,
+export checksum, selected route, and a deterministic checksum. The existing
+`approval.package_checksum` also includes the selected route and audit package
+checksum, so changing either after approval invalidates the package.
+
+### Legacy compatibility
+
+Records without the additive anti-slop contract remain readable in early
+states for migration and may carry warnings. A record with an explicit Canva
+remote reference, render, or a state at/after `BRAND_QA` cannot use that
+compatibility path: missing route selection, source/brief, controls, evidence,
+critique, or package checksum is an error. A local `DESIGN_DRAFT` without a
+remote reference remains migratable. This preserves old draft handoffs while
+keeping remote mutation and approval fail-closed.
+
 ## Required top-level fields
 
 | Field | Meaning |
@@ -21,6 +114,13 @@ normative executable contract; this document explains its fields and workflow.
 | `content_pillar` | Portfolio category for planning and measurement |
 | `single_message` | The one idea the audience should retain |
 | `source_context` | Brief, HTTPS sources, retrieval time, instruction boundary |
+| `source_packet` | Scoped observation, proof IDs, allowed assets, and recent fingerprints |
+| `creative_brief` | Audience tension, takeaway, point of view, action, and forbidden claims |
+| `route_set` | Three to five genuinely different route cards before Canva mutation |
+| `human_selected_route` | Human route decision bound to scope before remote mutation/final states |
+| `art_direction` | Selected-route visual premise and exactly one distinctive move |
+| `production_controls` | Approved template, folder, Brand Controls snapshot, locks, and editable slots |
+| `anti_slop_audit` | Explainable findings, 0–5 slop dimensions, rubric, evidence, blockers, critique, and package |
 | `experiment` | One-variable hypothesis/variant contract or `none` |
 | `slides` | Ordered creative units, even for a one-slide static post |
 | `caption` | `hook`, `body`, `cta`, and `hashtags` |

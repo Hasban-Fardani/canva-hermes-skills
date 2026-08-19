@@ -29,6 +29,184 @@
     "retrieved_at": "2026-08-19T09:00:00+07:00",
     "external_content_treated_as_data": true
   },
+  "source_packet": {
+    "scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand"
+    },
+    "objective": "Help a first-time reader prepare the right information before starting a service process.",
+    "audience_situation": "The reader is unsure which information is actually needed and worries that corrections will restart the process.",
+    "observation": "People keep the source of a changed name, location, or document in separate places, so they cannot explain the latest version.",
+    "proof_ids": ["proof-organise", "proof-checklist"],
+    "allowed_assets": ["diagram-data-flow"],
+    "forbidden_claims": ["guaranteed approval", "faster processing"],
+    "sources": [
+      {"source_id": "source-brief", "locator": "local:approved-brief"},
+      {"source_id": "source-checklist", "locator": "local:service-checklist"}
+    ],
+    "retrieved_at": "2026-08-19T09:00:00+07:00",
+    "recent_fingerprints": {
+      "scope": {
+        "tenant_id": "sample-tenant",
+        "client_id": "sample-client",
+        "product_id": "sample-product",
+        "brand_id": "sample-brand"
+      },
+      "window": "28d",
+      "hooks": ["Mulai Proses dari Data yang Rapi"],
+      "ctas": ["Simpan panduan ini."],
+      "layout_families": ["stacked-checklist"],
+      "motifs": ["document-outline"],
+      "phrases": ["data yang rapi"],
+      "similarity_checks": [
+        {"candidate_id": "recent-education-001", "similarity": 0.24, "threshold": 0.80, "status": "pass"}
+      ]
+    }
+  },
+  "creative_brief": {
+    "scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand"
+    },
+    "audience_situation": "A first-time reader is preparing a service process and cannot tell which records need a source.",
+    "tension": "The reader wants to move forward, but scattered records make every correction feel like a restart.",
+    "takeaway": "A small source trail makes the next correction easier to locate.",
+    "proof_ids": ["proof-organise", "proof-checklist"],
+    "point_of_view": "Show the reader how to make a process traceable instead of promising a faster outcome.",
+    "desired_action": "Save the guide and create one source note before starting.",
+    "forbidden_claims": ["guaranteed approval", "faster processing"]
+  },
+  "route_set": {
+    "scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand"
+    },
+    "generated_at": "2026-08-19T09:15:00+07:00",
+    "routes": [
+      {
+        "route_id": "field-note",
+        "route_name": "Field note",
+        "strategic_idea": "Start with the moment a correction becomes hard to trace.",
+        "audience_tension": "The reader cannot tell which version of a record is current.",
+        "message_promise": "A short source note keeps the next correction findable.",
+        "proof_ids": ["proof-organise"],
+        "visual_premise": "A single document trail moves from scattered notes to one marked source.",
+        "narrative_order": ["friction", "source note", "next action"],
+        "asset_plan": ["diagram-data-flow", "editable-source-label"],
+        "distinctive_move": "Use a visible red thread connecting each change to its source.",
+        "risk": "The thread could become decorative if labels are missing.",
+        "why_different_from_recent_posts": "Uses an annotated field note and a causal trail instead of the recent stacked checklist.",
+        "variation_axes": ["field-note", "causal-trail"]
+      },
+      {
+        "route_id": "proof-demo",
+        "route_name": "Proof demo",
+        "strategic_idea": "Show the same record before and after a source label is added.",
+        "audience_tension": "The reader has information but cannot explain why one version should be trusted.",
+        "message_promise": "One source label makes a correction easier to verify.",
+        "proof_ids": ["proof-checklist"],
+        "visual_premise": "A split-screen comparison with editable labels and one highlighted change.",
+        "narrative_order": ["before", "label", "after", "action"],
+        "asset_plan": ["diagram-before-after", "editable-callout"],
+        "distinctive_move": "Freeze one changed field in a before/after comparison.",
+        "risk": "The comparison must not imply a guaranteed process result.",
+        "why_different_from_recent_posts": "Uses a before/after proof frame and a single changed field, not a list of steps.",
+        "variation_axes": ["before-after", "proof-frame"]
+      },
+      {
+        "route_id": "myth-correction",
+        "route_name": "Myth correction",
+        "strategic_idea": "Correct the assumption that every record belongs in one undifferentiated folder.",
+        "audience_tension": "The reader saves everything together and loses the reason each item matters.",
+        "message_promise": "Separate requested records from supporting evidence before the first review.",
+        "proof_ids": ["proof-checklist"],
+        "visual_premise": "Two labeled trays sort records by their role in the process.",
+        "narrative_order": ["assumption", "correction", "sort", "action"],
+        "asset_plan": ["diagram-two-trays", "editable-role-labels"],
+        "distinctive_move": "Turn the page into two physical trays with a deliberate handoff between them.",
+        "risk": "The tray labels must remain literal at thumbnail size.",
+        "why_different_from_recent_posts": "Uses a myth-to-sort interaction and physical trays instead of a document checklist.",
+        "variation_axes": ["myth-correction", "sorting-trays"]
+      }
+    ]
+  },
+  "human_selected_route": {
+    "route_id": "field-note",
+    "decision": "selected",
+    "selected_by": "member-fixture",
+    "selected_at": "2026-08-19T09:30:00+07:00",
+    "scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand"
+    },
+    "reason": "The causal source trail matches the audience's correction problem and keeps the CTA singular."
+  },
+  "art_direction": {
+    "route_id": "field-note",
+    "visual_premise": "A single document trail moves from scattered notes to one marked source.",
+    "distinctive_move": "Use a visible red thread connecting each change to its source.",
+    "rationale": "The red thread makes traceability visible without adding an unrelated decorative motif.",
+    "decorative_elements": [
+      {"id": "source-thread", "semantic_role": "connects a changed field to its evidence", "rationale": "The line explains the relationship and is not filler."}
+    ]
+  },
+  "anti_slop_audit": {
+    "schema_version": "1.0",
+    "status": "pending",
+    "reason_codes": [],
+    "findings": [],
+    "slop_index": {
+      "generic_language": 0,
+      "visual_convergence": 0,
+      "decorative_filler": 0,
+      "evidence_gap": 0,
+      "process_debt": 0
+    },
+    "rubric": {
+      "brief_and_communication_fit": 18,
+      "distinctive_idea": 16,
+      "brand_expression": 12,
+      "hierarchy_and_readability": 13,
+      "copy_clarity_and_evidence": 12,
+      "craft_and_consistency": 7,
+      "channel_and_accessibility": 4,
+      "total": 82
+    },
+    "evidence": {
+      "ocr": {"status": "pending", "exact_match": false},
+      "layout": {"status": "pending", "overflow": false, "overlap": false},
+      "semantic": {"status": "pending"},
+      "wcag": {"status": "pending", "contrast_pass": false},
+      "rights": {"status": "pending"},
+      "recent_similarity": {"status": "pending"}
+    },
+    "hard_blockers": {
+      "scope_alignment": "pending",
+      "source_and_claim_evidence": "pending",
+      "rights_provenance": "pending",
+      "ocr_exact_match": "pending",
+      "layout_integrity": "pending",
+      "semantic_contract": "pending",
+      "wcag_accessibility": "pending",
+      "template_controls": "pending",
+      "approval_package": "pending"
+    },
+    "independent_critique": {
+      "status": "pending",
+      "reviewer_id": "independent-critic-fixture",
+      "independent_from_generation": true,
+      "findings": []
+    },
+    "approval_package": null
+  },
   "experiment": {
     "experiment_id": null,
     "hypothesis": null,
@@ -45,6 +223,9 @@
       "headline": "Mulai Proses dari Data yang Rapi",
       "body": "",
       "cta": "",
+      "page_role": "cover",
+      "visual_role": "single document trail anchor",
+      "proof_ids": [],
       "visual_direction": "Headline besar pada reading surface terang; satu ilustrasi dokumen; footer identitas tetap.",
       "accessibility_note": "Pastikan headline kontras tinggi dan tidak bertumpuk dengan ilustrasi."
     },
@@ -54,6 +235,9 @@
       "headline": "Kenapa Persiapan Data Penting?",
       "body": "Informasi yang tidak konsisten membuat pembaca sulit mengetahui data mana yang perlu dicek lebih dulu.",
       "cta": "",
+      "page_role": "context",
+      "visual_role": "scattered-to-structured comparison",
+      "proof_ids": ["proof-organise"],
       "visual_direction": "Dua kolom sederhana: data terpencar dan data terstruktur; tanpa foto dekoratif.",
       "accessibility_note": "Gunakan label teks selain perbedaan warna."
     },
@@ -63,6 +247,9 @@
       "headline": "Susun Informasi Dasar",
       "body": "Kelompokkan data pemilik, lokasi, dan dokumen yang memang diminta pada proses yang berlaku.",
       "cta": "",
+      "page_role": "steps",
+      "visual_role": "numbered source grouping",
+      "proof_ids": ["proof-checklist"],
       "visual_direction": "Tiga kartu bernomor dengan ikon dari satu keluarga visual.",
       "accessibility_note": "Nomor dan judul kartu menentukan urutan baca."
     },
@@ -72,6 +259,9 @@
       "headline": "Cek Sebelum Diajukan",
       "body": "Bandingkan kembali nama, lokasi, dan data utama. Tandai bagian yang masih membutuhkan sumber atau konfirmasi.",
       "cta": "",
+      "page_role": "proof",
+      "visual_role": "traceability checklist",
+      "proof_ids": ["proof-checklist"],
       "visual_direction": "Checklist ringkas dengan satu tanda per baris dan ruang putih yang cukup.",
       "accessibility_note": "Setiap status memiliki kata, bukan tanda warna saja."
     },
@@ -81,6 +271,9 @@
       "headline": "Buat Proses Lebih Mudah Ditelusuri",
       "body": "Simpan catatan sumber dan perubahan agar koreksi tidak dimulai dari awal.",
       "cta": "Simpan panduan ini.",
+      "page_role": "cta",
+      "visual_role": "single action close",
+      "proof_ids": [],
       "visual_direction": "Satu CTA pada kartu merah, tanpa elemen promosi kedua.",
       "accessibility_note": "CTA berbentuk teks jelas dengan kontras tinggi."
     }
@@ -108,6 +301,7 @@
       "height": 1350
     },
     "safe_area_px": 64,
+    "folder_id": "folder-sample-social",
     "draft_ref": null,
     "render_ref": null,
     "remote_scope": null,
@@ -124,6 +318,44 @@
   },
   "template_registry": {
     "entries": []
+  },
+  "production_controls": {
+    "scope": {
+      "tenant_id": "sample-tenant",
+      "client_id": "sample-client",
+      "product_id": "sample-product",
+      "brand_id": "sample-brand"
+    },
+    "template": {
+      "template_id": "brand-template-001",
+      "version": "1",
+      "provider": "canva",
+      "provider_template_id": "CanvaOpaqueTemplate-EXAMPLE-001",
+      "status": "approved"
+    },
+    "folder": {
+      "folder_id": "folder-sample-social",
+      "status": "approved",
+      "scope": {
+        "tenant_id": "sample-tenant",
+        "client_id": "sample-client",
+        "product_id": "sample-product",
+        "brand_id": "sample-brand"
+      }
+    },
+    "brand_controls": {
+      "snapshot_id": "brand-controls-snapshot-001",
+      "revision": "2026-08-19T08:00:00Z-r1",
+      "status": "approved",
+      "scope": {
+        "tenant_id": "sample-tenant",
+        "client_id": "sample-client",
+        "product_id": "sample-product",
+        "brand_id": "sample-brand"
+      },
+      "locked_elements": ["logo", "footer-signature"],
+      "editable_slots": ["headline", "body", "cta", "source-label"]
+    }
   },
   "policy": {
     "schema_version": "1.0",

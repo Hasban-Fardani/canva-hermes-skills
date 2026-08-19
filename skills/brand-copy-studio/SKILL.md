@@ -112,6 +112,13 @@ content-production skill after a local brand snapshot exists.
    master revision instead of duplicating master brand rules. Keep the skill
    folder generic. Do not write to a provider, social account, or shared remote
    workspace.
+10. Treat the anti-slop creative contract as an evidence and governance gate,
+    not an authorship detector. Capture audience situations, strategic tension,
+    human proof points, positive/negative voice examples, distinctive assets,
+    visual principles, composition rules, avoid patterns, model-use policy,
+    approval roles, and scoped feedback reason codes in the brand profile.
+    Drafts may leave these fields incomplete; `active` and approved registry
+    records may not.
 
 ## Choose a mode
 
@@ -144,6 +151,12 @@ an immutable copy under `versions/<revision>/`:
   never provider-specific IDs unless a tool confirmed them;
 - `provenance.json` — source inventory, authorization record, evidence ledger,
   revision, and update receipt.
+
+The additive anti-slop contract is defined in
+[references/canonical-schema.md](references/canonical-schema.md). It requires
+human approval for privileged model use and binds feedback reason codes to the
+exact tenant/client/brand/product scope. The validator emits explainable
+field/reason errors; it never computes an AI detector score.
 
 Start new work from the empty templates in `assets/`; they contain no real brand
 data. Validate all four files together with:

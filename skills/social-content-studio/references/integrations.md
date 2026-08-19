@@ -13,6 +13,12 @@ provider and Hermes documentation before production work.
 | Bounded variants | Approved template and dataset | Validate fields and inspect a canary render |
 | Unsupported action | Manual handoff | Do not claim remote success |
 
+For every new message or visual language, the content contract must first pass
+the scoped source packet, three-to-five route-card, human route-selection, and
+art-direction gates in
+[`references/content-contract.md`](references/content-contract.md). A Canva
+mutation is not authorized by a prompt or by a folder search result.
+
 Keep design, render, export, and manual handoff separate from optional social
 publishing. Canva-only work does not require a publishing login or temporary
 public media. Collect publishing prerequisites only after an explicit request.
@@ -34,11 +40,23 @@ After setup:
 5. Show proposed edit operations before committing them.
 6. Treat an edit/design reference as a runtime handoff value; do not commit it.
 
+Before step 5, verify the selected route and art direction. Before any remote
+write, verify the approved template/version, exact provider template ID,
+folder ID, and Brand Controls snapshot all carry the same full scope. A design
+reference without `human_selected_route`, scoped production controls, recent
+fingerprint metadata, or a pending anti-slop audit is rejected.
+
 ## Export and local download
 
 Request an export only after the applicable native and human/policy gates. Treat
 the job as asynchronous and use its live status/result schema. Do not infer
 success from job creation or invent a result field.
+
+Export additionally requires passing OCR, layout, semantic, WCAG, rights, and
+recent-similarity evidence, an independent critique, and the exact
+`anti_slop_audit.approval_package` checksum. The package checksum is bound to
+the selected route, render digest, export checksum, caption, target, and
+schedule; any change returns the record to review.
 
 Download successful media immediately with
 `scripts/download_canva_export.py`, preferably using its bounded standard-input

@@ -66,6 +66,10 @@ FORBIDDEN_DIR_NAMES = {
     "caches",
     "exports",
     "receipts",
+    "feedback",
+    "fingerprints",
+    "approvals",
+    "measurements",
     "runtime",
     "node_modules",
 }

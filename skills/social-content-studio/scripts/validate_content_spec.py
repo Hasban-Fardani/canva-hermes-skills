@@ -9,6 +9,7 @@ import importlib.util
 import json
 import re
 import sys
+from types import MappingProxyType
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +44,77 @@ PREFLIGHT_STATUSES = {
     "asset_rights": {"pending", "pass", "fail", "not_applicable"},
 }
 
+# Anti-slop is an editorial/production quality contract.  It deliberately
+# contains no authorship or detector probability field: findings must point to
+# an observable copy, visual, evidence, or process issue.
+ANTI_SLOP_STATES = {"DESIGN_DRAFT", "BRAND_QA", "HUMAN_APPROVED", "SCHEDULED", "PUBLISHED", "MEASURED"}
+ANTI_SLOP_EVIDENCE_KEYS = (
+    "ocr",
+    "layout",
+    "semantic",
+    "wcag",
+    "rights",
+    "recent_similarity",
+)
+ANTI_SLOP_EVIDENCE_STATUSES = {"pending", "pass", "fail", "not_applicable"}
+ANTI_SLOP_HARD_BLOCKER_KEYS = {
+    "scope_alignment", "source_and_claim_evidence", "rights_provenance",
+    "ocr_exact_match", "layout_integrity", "semantic_contract",
+    "wcag_accessibility", "template_controls", "approval_package",
+}
+ANTI_SLOP_REASON_CODES = {
+    "generic_language",
+    "same_layout_cluster",
+    "repeated_hook",
+    "repeated_cta",
+    "decorative_filler",
+    "unsupported_claim",
+    "missing_source",
+    "rights_unresolved",
+    "ocr_mismatch",
+    "layout_collision",
+    "semantic_mismatch",
+    "wcag_contrast",
+    "missing_alt_text",
+    "template_scope_mismatch",
+    "folder_scope_mismatch",
+    "brand_controls_missing",
+    "route_not_distinct",
+    "route_not_selected",
+    "independent_critique_missing",
+    "approval_package_missing",
+}
+ANTI_SLOP_REASON_CODE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,63}")
+ANTI_SLOP_SLOP_DIMENSIONS = (
+    "generic_language",
+    "visual_convergence",
+    "decorative_filler",
+    "evidence_gap",
+    "process_debt",
+)
+ANTI_SLOP_RUBRIC_WEIGHTS = {
+    "brief_and_communication_fit": 20,
+    "distinctive_idea": 20,
+    "brand_expression": 15,
+    "hierarchy_and_readability": 15,
+    "copy_clarity_and_evidence": 15,
+    "craft_and_consistency": 10,
+    "channel_and_accessibility": 5,
+}
+UNIVERSAL_DETECTOR_KEY_RE = re.compile(
+    r"(?:ai|llm|model|machine)[_-]?(?:probability|score|likelihood|authorship)|"
+    r"(?:detector|classifier)(?:[_-](?:score|probability|confidence|result|label))?|"
+    r"(?:authorship|human(?:ness|likeness))[_-]?(?:probability|score|likelihood|confidence)",
+    re.IGNORECASE,
+)
+GENERIC_ROUTE_RE = re.compile(
+    r"\b(?:konten|post|materi)\s+(?:edukasi|informatif)|"
+    r"\b(?:meningkatkan|membangun)\s+(?:awareness|engagement)|"
+    r"\b(?:bagikan|memberikan)\s+(?:tips|informasi|edukasi)\b|"
+    r"\b(?:solusi|layanan)\s+(?:inovatif|terbaik|mudah|cepat|aman|terpercaya)\b",
+    re.IGNORECASE,
+)
+
 DEFAULT_BUDGETS = {
     "headline_chars": 60,
     "body_chars": 220,
@@ -73,6 +145,26 @@ SAFE_REGISTRY_ID_RE = SAFE_SCOPE_ID_RE
 POLICY_ROLES = {"admin", "lead", "reviewer", "member", "publisher"}
 IDENTITY_SOURCES = {"authenticated", "local_policy", "local_authenticated_policy"}
 TRUSTED_POLICY_SOURCE = "local_authenticated_policy"
+
+
+@dataclass(frozen=True)
+class TrustedPolicyContext:
+    """Immutable receipt for a policy loaded outside the content record."""
+    payload: Any
+    source_path: str
+    canonical_digest: str
+
+    @property
+    def data(self) -> dict[str, Any]:
+        return self.payload
+
+
+def load_trusted_policy(path: Path) -> TrustedPolicyContext:
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        raise ValueError("Trusted policy file must contain an object")
+    canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return TrustedPolicyContext(MappingProxyType(data), str(path.resolve()), "sha256:" + hashlib.sha256(canonical).hexdigest())
 POLICY_MODES = {"attended", "unattended"}
 MEASUREMENT_WINDOWS = {"24h", "72h", "7d", "28d"}
 MEASUREMENT_DATA_MODES = {"organic", "paid", "mixed", "unknown"}
@@ -291,7 +383,7 @@ def _validate_provider_template_id(value: Any, path: str, report: Report) -> str
 
 
 def _scope_with_brand(scope: dict[str, str] | None) -> dict[str, str] | None:
-    if scope is None:
+    if not isinstance(scope, dict) or any(not isinstance(scope.get(key), str) for key in ("tenant_id", "client_id", "product_id", "brand_id")):
         return None
     return {key: scope[key] for key in ("tenant_id", "client_id", "product_id", "brand_id")}
 
@@ -354,6 +446,43 @@ def _validate_remote_scope(
 def _mapped_identity(policy: dict[str, Any], identity: Any, role: Any) -> bool:
     mapping = policy.get("role_mapping")
     return isinstance(mapping, dict) and role in POLICY_ROLES and isinstance(mapping.get(role), list) and identity in mapping[role]
+
+
+def _canonical_unattended_authorization(value: Any) -> dict[str, Any] | None:
+    """Return only capability-bearing unattended fields in canonical form.
+
+    The embedded record is audit-only.  A separately loaded policy must carry
+    this complete subtree, so changing a target, claim, recipe, budget, or
+    template cannot smuggle a new capability past the trusted boundary.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    preapproved = value.get("preapproved")
+    if not isinstance(preapproved, dict):
+        return None
+    return {
+        "enabled": value.get("enabled"),
+        "policy_id": value.get("policy_id"),
+        "policy_revision": value.get("policy_revision"),
+        "scope": value.get("scope"),
+        "enabled_by": value.get("enabled_by"),
+        "enabled_by_role": value.get("enabled_by_role"),
+        "enabled_at": value.get("enabled_at"),
+        "preapproved": {
+            "copy_recipe_ids": preapproved.get("copy_recipe_ids"),
+            "copy_recipe_versions": preapproved.get("copy_recipe_versions"),
+            "copy_recipe_brand_revisions": preapproved.get("copy_recipe_brand_revisions"),
+            "template_ids": preapproved.get("template_ids"),
+            "template_versions": preapproved.get("template_versions"),
+            "template_provider_ids": preapproved.get("template_provider_ids"),
+            "claim_ids": preapproved.get("claim_ids"),
+            "targets": preapproved.get("targets"),
+            "pillars": preapproved.get("pillars"),
+            "formats": preapproved.get("formats"),
+            "field_budgets": preapproved.get("field_budgets"),
+        },
+    }
 
 
 def _validate_policy(spec: dict[str, Any], expected_scope: dict[str, str] | None, report: Report) -> dict[str, Any]:
@@ -499,9 +628,12 @@ def _validate_trusted_policy(
                 "Draft is usable with a pending policy snapshot, but cannot cross approval, unattended, schedule, or publish gates without trusted policy.",
             )
         return
-    if not isinstance(policy_context, dict):
-        report.error("trusted_policy_type", "$policy", "Trusted policy context must be an object loaded outside the content record.")
+    if not isinstance(policy_context, TrustedPolicyContext):
+        if policy_context is spec.get("policy") or policy_context == spec.get("policy"):
+            report.error("trusted_policy_embedded", "$policy", "The embedded or copied policy snapshot cannot authorize privileged content.")
+        report.error("trusted_policy_type", "$policy", "Privileged states require an immutable TrustedPolicyContext produced by load_trusted_policy; arbitrary dictionaries cannot authorize.")
         return
+    policy_context = policy_context.data
     if policy_context is spec.get("policy") or policy_context is embedded:
         report.error(
             "trusted_policy_embedded",
@@ -530,9 +662,17 @@ def _validate_trusted_policy(
         report.error("trusted_policy_roles", "$policy.role_mapping", "Trusted role mapping must match the content snapshot exactly.")
     embedded_unattended = embedded.get("unattended")
     if isinstance(embedded_unattended, dict) and embedded_unattended.get("enabled") is True:
+        trusted_unattended = policy_context.get("unattended")
+        embedded_authorization = _canonical_unattended_authorization(embedded_unattended)
+        trusted_authorization = _canonical_unattended_authorization(trusted_unattended)
+        if trusted_authorization is None or trusted_authorization != embedded_authorization:
+            report.error(
+                "trusted_policy_unattended_exact",
+                "$policy.unattended",
+                "Trusted policy must exactly match the complete embedded unattended authorization subtree; embedded content remains audit-only.",
+            )
         embedded_preapproved = embedded_unattended.get("preapproved")
         embedded_provider_ids = embedded_preapproved.get("template_provider_ids") if isinstance(embedded_preapproved, dict) else None
-        trusted_unattended = policy_context.get("unattended")
         trusted_preapproved = trusted_unattended.get("preapproved") if isinstance(trusted_unattended, dict) else None
         trusted_provider_ids = trusted_preapproved.get("template_provider_ids") if isinstance(trusted_preapproved, dict) else None
         if not isinstance(trusted_provider_ids, dict):
@@ -592,6 +732,9 @@ BRAND_BUNDLE_FILES = ("brand-profile.json", "claim-registry.json", "template-reg
 def _load_brand_bundle_validator() -> Any:
     """Load the sibling Brand Copy validator without copying its contract here."""
 
+    cached = sys.modules.get("social_content_brand_bundle_validator")
+    if cached is not None:
+        return cached
     validator_path = Path(__file__).resolve().parents[2] / "brand-copy-studio" / "scripts" / "validate_brand_bundle.py"
     if not validator_path.is_file():
         return None
@@ -599,9 +742,18 @@ def _load_brand_bundle_validator() -> Any:
     if module_spec is None or module_spec.loader is None:
         return None
     module = importlib.util.module_from_spec(module_spec)
+    module_name = module_spec.name
+    previous_module = sys.modules.get(module_name)
+    # Python 3.14's dataclass resolver requires the dynamically loaded module
+    # to be visible in sys.modules while decorators execute.
+    sys.modules[module_name] = module
     try:
         module_spec.loader.exec_module(module)
     except (ImportError, OSError, SyntaxError, TypeError, ValueError):
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
         return None
     return module
 
@@ -981,6 +1133,9 @@ def _all_content_text(spec: dict[str, Any]) -> str:
 
 
 def _scan_for_secrets(value: Any, report: Report, path: str = "$") -> None:
+    if isinstance(value, str) and re.search(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", value, re.IGNORECASE):
+        report.error("secret_value", path, "A bearer-token-like value is forbidden in content records; value redacted.")
+        return
     if isinstance(value, dict):
         for key, child in value.items():
             child_path = f"{path}.{key}"
@@ -990,6 +1145,706 @@ def _scan_for_secrets(value: Any, report: Report, path: str = "$") -> None:
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _scan_for_secrets(child, report, f"{path}[{index}]")
+
+
+def _scan_for_universal_detector_fields(value: Any, report: Report, path: str = "$") -> None:
+    """Reject authorship/detector scores; retain explainable editorial findings."""
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if isinstance(key, str) and UNIVERSAL_DETECTOR_KEY_RE.search(key):
+                report.error(
+                    "universal_detector_field",
+                    child_path,
+                    "Do not store AI/authorship detector probabilities or scores; record an explainable finding instead.",
+                )
+            _scan_for_universal_detector_fields(child, report, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _scan_for_universal_detector_fields(child, report, f"{path}[{index}]")
+
+
+def _anti_scope(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def _validate_anti_scope(
+    value: Any,
+    path: str,
+    expected_scope: dict[str, str] | None,
+    report: Report,
+    *,
+    required: bool,
+) -> None:
+    if value is None:
+        if required:
+            report.error("anti_slop_scope_missing", path, "Anti-slop evidence must carry the complete tenant/client/product/brand scope.")
+        return
+    if not isinstance(value, dict):
+        report.error("anti_slop_scope_type", path, "Anti-slop scope must be an object.")
+        return
+    expected = _scope_with_brand(expected_scope)
+    if expected is None or value != expected:
+        if required:
+            report.error("anti_slop_scope_mismatch", path, "Anti-slop evidence scope must exactly match the active content scope.")
+        else:
+            report.warning("anti_slop_scope_pending", path, "Draft anti-slop evidence has a scope mismatch and cannot authorize a remote or final state.")
+
+
+def _validate_source_packet_and_brief(
+    spec: dict[str, Any],
+    expected_scope: dict[str, str] | None,
+    state: Any,
+    report: Report,
+) -> None:
+    """Validate scoped evidence and the brief tension before concept routes."""
+
+    remote_or_final = _anti_slop_route_required(spec, state)
+    packet = spec.get("source_packet")
+    brief = spec.get("creative_brief")
+    if packet is None and not remote_or_final:
+        return
+    if not isinstance(packet, dict):
+        report.error("source_packet_required", "$.source_packet", "Canva mutation/final states require a scoped source_packet.")
+    else:
+        _validate_anti_scope(packet.get("scope"), "$.source_packet.scope", expected_scope, report, required=remote_or_final)
+        for key in ("objective", "audience_situation", "observation"):
+            if not _nonempty_string(packet.get(key)):
+                report.error("source_packet_field", f"$.source_packet.{key}", "Source packet requires objective, audience situation, and a concrete observation.")
+        proof_ids = packet.get("proof_ids", [])
+        if not isinstance(proof_ids, list) or any(not _safe_registry_id(item) for item in proof_ids):
+            report.error("source_packet_proof_ids", "$.source_packet.proof_ids", "proof_ids must be a list of scoped lowercase registry IDs.")
+        elif remote_or_final and not proof_ids:
+            report.error("source_packet_proof_ids", "$.source_packet.proof_ids", "Final states require at least one resolved proof ID.")
+        sources = packet.get("sources", packet.get("source_urls"))
+        if sources is not None and not isinstance(sources, list):
+            report.error("source_packet_sources", "$.source_packet.sources", "Source packet sources must be a list.")
+        elif isinstance(sources, list):
+            if remote_or_final and not sources:
+                report.error("source_packet_sources", "$.source_packet.sources", "Final states require non-empty source locators.")
+            for index, source in enumerate(sources):
+                if isinstance(source, str):
+                    if not _valid_https_url(source):
+                        report.error("source_packet_source", f"$.source_packet.sources[{index}]", "Source packet URLs must be HTTPS.")
+                elif not isinstance(source, dict) or not (_nonempty_string(source.get("source_id")) or _valid_https_url(source.get("url"))):
+                    report.error("source_packet_source", f"$.source_packet.sources[{index}]", "Each source needs a source_id or HTTPS url.")
+        retrieved_at = packet.get("retrieved_at")
+        if remote_or_final and _parse_datetime(retrieved_at) is None:
+            report.error("source_packet_retrieved_at", "$.source_packet.retrieved_at", "Source packet retrieved_at must be timezone-aware ISO 8601.")
+        fingerprints = packet.get("recent_fingerprints", packet.get("recent_fingerprint"))
+        if fingerprints is None:
+            fingerprints = spec.get("recent_fingerprints", spec.get("recent_fingerprint"))
+        if fingerprints is not None:
+            _validate_recent_fingerprints(fingerprints, "$.source_packet.recent_fingerprints", expected_scope, report, required=remote_or_final)
+        elif remote_or_final:
+            report.error("recent_fingerprints_missing", "$.source_packet.recent_fingerprints", "Canva mutation/final states require recent scoped fingerprints and similarity metadata.")
+
+    if brief is None and not remote_or_final:
+        return
+    if not isinstance(brief, dict):
+        report.error("creative_brief_required", "$.creative_brief", "Canva mutation/final states require a creative brief with audience tension.")
+        return
+    for key in ("audience_situation", "tension", "takeaway", "point_of_view", "desired_action"):
+        if not _nonempty_string(brief.get(key)):
+            report.error("creative_brief_field", f"$.creative_brief.{key}", "Creative brief requires a specific tension, takeaway, point of view, and action.")
+    proof_ids = brief.get("proof_ids", [])
+    if not isinstance(proof_ids, list) or any(not _safe_registry_id(item) for item in proof_ids):
+        report.error("creative_brief_proof_ids", "$.creative_brief.proof_ids", "Creative brief proof_ids must be a list of scoped lowercase registry IDs.")
+    if isinstance(packet, dict) and isinstance(packet.get("scope"), dict) and brief.get("scope") is not None:
+        _validate_anti_scope(brief.get("scope"), "$.creative_brief.scope", expected_scope, report, required=remote_or_final)
+
+
+def _anti_slop_route_required(spec: dict[str, Any], state: Any) -> bool:
+    design = spec.get("design")
+    if isinstance(design, dict):
+        mutation_status = design.get("mutation_status")
+        if design.get("canva_mutation") is True or (isinstance(mutation_status, str) and mutation_status in {"requested", "succeeded", "committed"}):
+            return True
+        if any(_nonempty_string(design.get(key)) for key in ("draft_ref", "canva_design_id", "canva_design_url", "render_ref")):
+            return True
+    # A local DESIGN_DRAFT remains migratable legacy data.  Once a render,
+    # remote design, or final/QA state exists, the anti-slop contract is a hard
+    # gate.
+    return state in ANTI_SLOP_STATES - {"DESIGN_DRAFT"}
+
+
+def _normalise_route_value(value: Any) -> str:
+    if isinstance(value, list):
+        return "|".join(_normalise_route_value(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _validate_route_set(
+    spec: dict[str, Any],
+    expected_scope: dict[str, str] | None,
+    state: Any,
+    report: Report,
+) -> list[dict[str, Any]]:
+    route_required = _anti_slop_route_required(spec, state) or spec.get("route_set") is not None
+    raw = spec.get("route_set")
+    if raw is None and not route_required:
+        return []
+    if not isinstance(raw, dict):
+        report.error("route_set_required", "$.route_set", "Canva mutation/final states require three to five route cards before production.")
+        return []
+    _validate_anti_scope(raw.get("scope"), "$.route_set.scope", expected_scope, report, required=_anti_slop_route_required(spec, state))
+    routes = raw.get("routes", raw.get("route_cards"))
+    if not isinstance(routes, list):
+        report.error("route_set_routes", "$.route_set.routes", "route_set.routes must be a list of route cards.")
+        return []
+    if not 3 <= len(routes) <= 5:
+        report.error("route_count", "$.route_set.routes", "Provide three to five genuinely different route cards before Canva production.")
+    seen: set[str] = set()
+    valid_routes: list[dict[str, Any]] = []
+    for index, route in enumerate(routes):
+        path = f"$.route_set.routes[{index}]"
+        if not isinstance(route, dict):
+            report.error("route_type", path, "Each route card must be an object.")
+            continue
+        route_id = route.get("route_id", route.get("id", route.get("route_name")))
+        if not _safe_registry_id(route_id):
+            report.error("route_id", f"{path}.route_id", "Route cards need a stable lowercase route_id.")
+        elif isinstance(route_id, str) and route_id in seen:
+            report.error("route_id_duplicate", f"{path}.route_id", "Route IDs must be unique.")
+        else:
+            seen.add(route_id)
+        required_fields = ("strategic_idea", "audience_tension", "message_promise", "visual_premise", "why_different_from_recent_posts")
+        for key in required_fields:
+            if not _nonempty_string(route.get(key)):
+                report.error("route_field", f"{path}.{key}", "Each route needs a specific idea, tension, promise, visual premise, and difference rationale.")
+        proof_ids = route.get("proof_ids", [])
+        if not isinstance(proof_ids, list) or any(not _safe_registry_id(item) for item in proof_ids):
+            report.error("route_proof_ids", f"{path}.proof_ids", "Route proof_ids must be a list of scoped lowercase IDs.")
+        move = route.get("distinctive_move")
+        moves = route.get("distinctive_moves")
+        if moves is not None:
+            if not isinstance(moves, list) or len(moves) != 1 or not _nonempty_string(moves[0]):
+                report.error("distinctive_move_count", f"{path}.distinctive_moves", "Each route must specify exactly one distinctive move.")
+        elif not _nonempty_string(move):
+            report.error("distinctive_move", f"{path}.distinctive_move", "Each route must specify exactly one distinctive move.")
+        else:
+            move = [move]
+        route_text = " ".join(str(route.get(key, "")) for key in required_fields + ("distinctive_move",))
+        placeholder = re.search(r"\b(?:tbd|todo|placeholder|lorem|same as|route\s*[0-9]+)\b", route_text, re.I)
+        if placeholder:
+            report.error("route_placeholder", path, "Route contains a trivial placeholder and cannot enter production.")
+        if GENERIC_ROUTE_RE.search(route_text):
+            report.warning("generic_route_warning", path, "Generic language detected; retain only when the route also has concrete tension, proof, and point of view.")
+            if GENERIC_ROUTE_RE.search(str(route.get("strategic_idea", ""))):
+                report.error("generic_route", path, "Strategic idea is generic and cannot be the route's distinctive point of view.")
+        for key in ("narrative_order", "asset_plan"):
+            if not isinstance(route.get(key), (str, list)) or not _normalise_route_value(route.get(key)):
+                report.error("route_field", f"{path}.{key}", "Route needs a concrete narrative_order and asset_plan.")
+        valid_routes.append(route)
+
+    route_axes = ("strategic_idea", "audience_tension", "visual_premise", "narrative_order", "asset_plan", "distinctive_move")
+    for left_index, left in enumerate(valid_routes):
+        for right in valid_routes[left_index + 1 :]:
+            differences = sum(
+                _normalise_route_value(left.get(key)) != _normalise_route_value(right.get(key)) for key in route_axes
+            )
+            if differences < 2:
+                report.error(
+                    "routes_not_distinct",
+                    "$.route_set.routes",
+                    f"Routes {left.get('route_id', left.get('id'))!r} and {right.get('route_id', right.get('id'))!r} differ on fewer than two axes ({', '.join(key for key in route_axes if _normalise_route_value(left.get(key)) != _normalise_route_value(right.get(key))) or 'none'}); color, font, or synonym changes are insufficient.",
+                )
+                break
+    return valid_routes
+
+
+def _validate_recent_fingerprints(
+    value: Any,
+    path: str,
+    expected_scope: dict[str, str] | None,
+    report: Report,
+    *,
+    required: bool,
+) -> None:
+    if not isinstance(value, dict):
+        report.error("recent_fingerprints_type", path, "Recent fingerprints must be an object with scope and similarity metadata.")
+        return
+    _validate_anti_scope(value.get("scope"), f"{path}.scope", expected_scope, report, required=required)
+    if not _nonempty_string(value.get("window")):
+        report.error("recent_fingerprints_window", f"{path}.window", "Recent fingerprints require a bounded observation window.")
+    fingerprint_fields = ("hooks", "ctas", "layout_families", "motifs", "phrases")
+    if required and not any(isinstance(value.get(key), list) and value.get(key) for key in fingerprint_fields):
+        report.error("recent_fingerprints_data", path, "Recent fingerprints need hooks, CTAs, layout families, motifs, or phrases.")
+    similarities = value.get("similarity_checks", value.get("similarities"))
+    if not isinstance(similarities, list):
+        report.error("similarity_metadata", f"{path}.similarity_checks", "Recent fingerprints require deterministic similarity metadata.")
+    else:
+        if required and not similarities:
+            report.error("similarity_metadata", f"{path}.similarity_checks", "Final states require non-empty similarity comparisons.")
+        for index, item in enumerate(similarities):
+            item_path = f"{path}.similarity_checks[{index}]"
+            if not isinstance(item, dict):
+                report.error("similarity_metadata", item_path, "Each similarity check must be an object.")
+                continue
+            if not _nonempty_string(item.get("candidate_id")):
+                report.error("similarity_metadata", f"{item_path}.candidate_id", "Similarity checks require a candidate ID.")
+            score = item.get("similarity")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+                report.error("similarity_score", f"{item_path}.similarity", "Similarity must be a number from 0 to 1.")
+            if item.get("status") not in {"pass", "fail", "pending"}:
+                report.error("similarity_status", f"{item_path}.status", "Similarity checks require pass, fail, or pending status.")
+
+
+def _route_id_from_selection(selection: Any) -> str | None:
+    if isinstance(selection, str):
+        return selection
+    if isinstance(selection, dict):
+        value = selection.get("route_id", selection.get("selected_route_id"))
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _validate_human_selected_route(
+    spec: dict[str, Any],
+    routes: list[dict[str, Any]],
+    expected_scope: dict[str, str] | None,
+    state: Any,
+    report: Report,
+) -> str | None:
+    selection = spec.get("human_selected_route")
+    required = _anti_slop_route_required(spec, state)
+    if selection is None:
+        if required:
+            report.error("human_selected_route_required", "$.human_selected_route", "A human must select a route before Canva mutation or final states.")
+        return None
+    route_id = _route_id_from_selection(selection)
+    route_ids = {
+        route.get("route_id", route.get("id", route.get("route_name")))
+        for route in routes
+        if isinstance(route.get("route_id", route.get("id", route.get("route_name"))), str)
+    }
+    if route_id not in route_ids:
+        report.error("human_selected_route_invalid", "$.human_selected_route", "human_selected_route must reference one of the generated route cards.")
+    if isinstance(selection, dict):
+        if selection.get("decision") not in {"selected", "approved"}:
+            report.error("human_selected_route_decision", "$.human_selected_route.decision", "Route selection decision must be selected or approved.")
+        if required:
+            _validate_anti_scope(selection.get("scope"), "$.human_selected_route.scope", expected_scope, report, required=True)
+        if required and not _nonempty_string(selection.get("selected_by")):
+            report.error("human_selected_route_actor", "$.human_selected_route.selected_by", "Route selection requires a human actor ID.")
+        if required and _parse_datetime(selection.get("selected_at")) is None:
+            report.error("human_selected_route_time", "$.human_selected_route.selected_at", "Route selection requires a timezone-aware timestamp.")
+        if required and not _nonempty_string(selection.get("reason")):
+            report.error("human_selected_route_reason", "$.human_selected_route.reason", "Route selection requires a reason.")
+    elif required:
+        report.error("human_selected_route_record", "$.human_selected_route", "Final/mutating routes require selection actor, timestamp, decision, and scope evidence.")
+    return route_id if isinstance(route_id, str) else None
+
+
+def _validate_art_direction(
+    spec: dict[str, Any],
+    selected_route_id: str | None,
+    state: Any,
+    report: Report,
+) -> None:
+    required = _anti_slop_route_required(spec, state)
+    art = spec.get("art_direction")
+    if art is None and not required:
+        return
+    if not isinstance(art, dict):
+        report.error("art_direction_required", "$.art_direction", "Canva mutation/final states require art direction before layout production.")
+        return
+    if selected_route_id and art.get("route_id") != selected_route_id:
+        report.error("art_direction_route_mismatch", "$.art_direction.route_id", "Art direction must reference the human-selected route.")
+    if not _nonempty_string(art.get("visual_premise")):
+        report.error("art_direction_field", "$.art_direction.visual_premise", "Art direction requires an observable visual premise.")
+    move = art.get("distinctive_move")
+    moves = art.get("distinctive_moves")
+    if moves is not None:
+        if not isinstance(moves, list) or len(moves) != 1 or not _nonempty_string(moves[0]):
+            report.error("distinctive_move_count", "$.art_direction.distinctive_moves", "Art direction must contain exactly one distinctive move.")
+    elif not _nonempty_string(move):
+        report.error("distinctive_move", "$.art_direction.distinctive_move", "Art direction requires exactly one distinctive move.")
+    if not _nonempty_string(art.get("rationale")):
+        report.error("art_direction_rationale", "$.art_direction.rationale", "Explain how the distinctive move serves the message.")
+    decorative = art.get("decorative_elements", [])
+    if not isinstance(decorative, list):
+        report.error("decorative_elements", "$.art_direction.decorative_elements", "decorative_elements must be a list.")
+    else:
+        for index, element in enumerate(decorative):
+            path = f"$.art_direction.decorative_elements[{index}]"
+            if not isinstance(element, dict):
+                report.error("decorative_element", path, "Each decorative element must document its semantic role and rationale.")
+                continue
+            if not _nonempty_string(element.get("semantic_role")) or not _nonempty_string(element.get("rationale")):
+                report.error("decorative_element_role", path, "Every decorative element requires semantic_role and rationale.")
+
+
+def _validate_production_controls(
+    spec: dict[str, Any],
+    expected_scope: dict[str, str] | None,
+    template_entries: list[dict[str, Any]],
+    state: Any,
+    report: Report,
+) -> None:
+    required = _anti_slop_route_required(spec, state)
+    controls = spec.get("production_controls", spec.get("canva_production", spec.get("canva_runtime")))
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    if controls is None and not required:
+        return
+    if controls is None:
+        # Accept the direct runtime metadata shape used by older handoffs while
+        # still validating every field as the same scoped production control.
+        direct_brand_controls = design.get("brand_controls_snapshot", spec.get("brand_controls_snapshot"))
+        direct_folder_id = design.get("folder_id", spec.get("folder_id"))
+        direct_template = design.get("template_snapshot")
+        if direct_brand_controls is not None or direct_folder_id is not None or direct_template is not None:
+            controls = {
+                "scope": design.get("remote_scope"),
+                "template": direct_template or {
+                    "template_id": design.get("template_id"),
+                    "version": design.get("template_version", design.get("template_revision")),
+                    "provider": design.get("provider"),
+                    "provider_template_id": _provider_template_id_value(design),
+                    "status": design.get("template_status", "approved"),
+                },
+                "folder": {
+                    "folder_id": direct_folder_id,
+                    "status": design.get("folder_status", "approved"),
+                    "scope": design.get("folder_scope", design.get("remote_scope")),
+                },
+                "brand_controls": direct_brand_controls,
+            }
+    if not isinstance(controls, dict):
+        report.error("production_controls_required", "$.production_controls", "Canva mutation/final states require approved template, folder, and Brand Controls snapshots.")
+        return
+    _validate_anti_scope(controls.get("scope"), "$.production_controls.scope", expected_scope, report, required=required)
+    template = controls.get("template", controls.get("approved_template"))
+    if not isinstance(template, dict):
+        template = controls
+    template_id = template.get("template_id")
+    template_version = template.get("version", template.get("template_version"))
+    provider_id = _provider_template_id_value(template)
+    if not _safe_registry_id(template_id):
+        report.error("production_template_missing", "$.production_controls.template.template_id", "Production controls require a local approved template ID.")
+    if not _nonempty_string(template_version):
+        report.error("production_template_version", "$.production_controls.template.version", "Production controls require an exact approved template version.")
+    if template.get("status") not in {"approved", "active"}:
+        report.error("production_template_unapproved", "$.production_controls.template.status", "Canva mutation/final states require an approved template snapshot.")
+    if _nonempty_string(design.get("template_id")) and design.get("template_id") != template_id:
+        report.error("template_snapshot_mismatch", "$.production_controls.template.template_id", "Production template must match design.template_id.")
+    if _nonempty_string(design.get("template_version")) and design.get("template_version") != template_version:
+        report.error("template_snapshot_mismatch", "$.production_controls.template.version", "Production template version must match design.template_version.")
+    design_provider = _provider_template_id_value(design)
+    if design_provider is not None and provider_id != design_provider:
+        report.error("template_snapshot_provider_mismatch", "$.production_controls.template", "Production template must carry the exact provider template ID used by Canva.")
+    matching_entries = [entry for entry in template_entries if entry.get("template_id") == template_id and entry.get("version") == template_version and entry.get("status") == "approved"]
+    if required and not matching_entries:
+        report.error("production_template_registry", "$.production_controls.template", "Production template must resolve to the approved scoped template registry.")
+
+    folder = controls.get("folder")
+    if folder is None:
+        folder = {
+            "folder_id": controls.get("folder_id"),
+            "status": controls.get("folder_status", "approved"),
+            "scope": controls.get("folder_scope", controls.get("scope")),
+        }
+    if not isinstance(folder, dict):
+        report.error("folder_snapshot", "$.production_controls.folder", "Production controls require an approved folder snapshot.")
+        folder = {}
+    _validate_anti_scope(folder.get("scope"), "$.production_controls.folder.scope", expected_scope, report, required=required)
+    if not _nonempty_string(folder.get("folder_id")):
+        report.error("folder_snapshot", "$.production_controls.folder.folder_id", "Folder snapshot requires an opaque folder_id.")
+    if folder.get("status") not in {"approved", "active"}:
+        report.error("folder_unapproved", "$.production_controls.folder.status", "Canva mutation/final states require an approved folder snapshot.")
+    for key in ("folder_id",):
+        if design.get(key) is not None and design.get(key) != folder.get(key):
+            report.error("folder_snapshot_mismatch", f"$.production_controls.folder.{key}", "Folder snapshot must match the design remote folder reference.")
+
+    brand_controls = controls.get("brand_controls", controls.get("brand_controls_snapshot"))
+    if isinstance(brand_controls, str):
+        brand_controls = {
+            "snapshot_id": brand_controls,
+            "revision": controls.get("brand_controls_revision", spec.get("brand_controls_revision", design.get("brand_controls_revision"))),
+            "status": controls.get("brand_controls_status", spec.get("brand_controls_status", design.get("brand_controls_status", "approved"))),
+            "scope": controls.get("brand_controls_scope", spec.get("brand_controls_scope", design.get("brand_controls_scope", design.get("remote_scope")))),
+            "locked_elements": controls.get("locked_elements", spec.get("locked_elements", design.get("locked_elements", []))),
+            "editable_slots": controls.get("editable_slots", spec.get("editable_slots", design.get("editable_slots", []))),
+        }
+    if not isinstance(brand_controls, dict):
+        report.error("brand_controls_snapshot", "$.production_controls.brand_controls", "Canva mutation/final states require a Brand Controls snapshot.")
+        return
+    _validate_anti_scope(brand_controls.get("scope"), "$.production_controls.brand_controls.scope", expected_scope, report, required=required)
+    if not _nonempty_string(brand_controls.get("snapshot_id")) or not _nonempty_string(brand_controls.get("revision")):
+        report.error("brand_controls_snapshot", "$.production_controls.brand_controls", "Brand Controls snapshot requires snapshot_id and revision.")
+    if brand_controls.get("status") not in {"approved", "active"}:
+        report.error("brand_controls_unapproved", "$.production_controls.brand_controls.status", "Brand Controls must be approved for Canva mutation/final states.")
+    for key in ("locked_elements", "editable_slots"):
+        if not isinstance(brand_controls.get(key), list):
+            report.error("brand_controls_fields", f"$.production_controls.brand_controls.{key}", "Brand Controls snapshot must list locked elements and editable slots.")
+    if required:
+        locked = set(brand_controls.get("locked_elements", [])) if isinstance(brand_controls.get("locked_elements"), list) else set()
+        editable = set(brand_controls.get("editable_slots", [])) if isinstance(brand_controls.get("editable_slots"), list) else set()
+        if not locked or not editable:
+            report.error("brand_controls_fields", "$.production_controls.brand_controls", "Final controls require non-empty locked and editable slot sets.")
+        if locked & editable:
+            report.error("brand_controls_overlap", "$.production_controls.brand_controls", "Locked elements and editable slots must be disjoint.")
+
+
+def _validate_page_contract(
+    spec: dict[str, Any],
+    source_packet: Any,
+    state: Any,
+    report: Report,
+) -> None:
+    if not _anti_slop_route_required(spec, state):
+        return
+    known_proof_ids = None
+    if isinstance(source_packet, dict) and isinstance(source_packet.get("proof_ids"), list):
+        raw_proof_ids = source_packet.get("proof_ids", [])
+        known_proof_ids = {item for item in raw_proof_ids if isinstance(item, str)}
+        if any(not isinstance(item, str) for item in raw_proof_ids):
+            report.error("source_packet_proof_ids", "$.source_packet.proof_ids", "Every proof ID must be a scalar string registry ID.")
+    slides = spec.get("slides")
+    if not isinstance(slides, list):
+        return
+    for index, slide in enumerate(slides):
+        path = f"$.slides[{index}]"
+        if not isinstance(slide, dict):
+            continue
+        page_role = slide.get("page_role", slide.get("role"))
+        visual_role = slide.get("visual_role")
+        if not _nonempty_string(page_role):
+            report.error("page_role_missing", f"{path}.page_role", "Every page needs an explicit page role.")
+        if not _nonempty_string(visual_role):
+            report.error("visual_role_missing", f"{path}.visual_role", "Every page needs an explicit visual role.")
+        proof_ids = slide.get("proof_ids", [])
+        if not isinstance(proof_ids, list) or any(not _safe_registry_id(item) for item in proof_ids):
+            report.error("page_proof_ids", f"{path}.proof_ids", "Every page needs a proof_ids list of scoped IDs (empty only when no proof is used).")
+        elif known_proof_ids is not None and any(item not in known_proof_ids for item in proof_ids):
+            report.error("page_proof_scope", f"{path}.proof_ids", "Page proof IDs must resolve to the scoped source packet.")
+
+
+def _validate_evidence_status(value: Any, path: str, report: Report) -> str | None:
+    if isinstance(value, str):
+        status = value
+    elif isinstance(value, dict):
+        status = value.get("status")
+    else:
+        report.error("anti_slop_evidence_type", path, "Evidence must be a status string or an object with status.")
+        return None
+    if status not in ANTI_SLOP_EVIDENCE_STATUSES:
+        report.error("anti_slop_evidence_status", path, "Evidence status must be pending, pass, fail, or not_applicable.")
+        return None
+    return status
+
+
+def _anti_slop_package_checksum(spec: dict[str, Any], audit: dict[str, Any]) -> str | None:
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    package = audit.get("approval_package") if isinstance(audit.get("approval_package"), dict) else {}
+    export_checksum = design.get("export_checksum")
+    content_scope = spec.get("scope") if isinstance(spec.get("scope"), dict) else None
+    full_content_scope = (
+        {**content_scope, "brand_id": spec.get("brand_id")}
+        if isinstance(content_scope, dict)
+        else None
+    )
+    payload = {
+        "content_id": spec.get("content_id"),
+        "scope": full_content_scope,
+        "selected_route": next((route for route in (spec.get("route_set", {}).get("routes", []) if isinstance(spec.get("route_set"), dict) else []) if route.get("route_id") == _route_id_from_selection(spec.get("human_selected_route"))), None),
+        "selection_record": spec.get("human_selected_route"),
+        "source_packet": spec.get("source_packet"),
+        "creative_brief": spec.get("creative_brief"),
+        "art_direction": spec.get("art_direction"),
+        "production_controls": spec.get("production_controls"),
+        "evidence": audit.get("evidence"),
+        "findings": audit.get("findings"),
+        "hard_blockers": audit.get("hard_blockers"),
+        "independent_critique": audit.get("independent_critique"),
+        "render_evidence": design.get("render_evidence"),
+        "audit_version": audit.get("schema_version"),
+        "slop_index": audit.get("slop_index"),
+        "rubric_total": (audit.get("rubric") or {}).get("total") if isinstance(audit.get("rubric"), dict) else None,
+        "render_digest": package.get("render_digest"),
+        "export_checksum": export_checksum,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_anti_slop_audit(
+    spec: dict[str, Any],
+    expected_scope: dict[str, str] | None,
+    state: Any,
+    template_entries: list[dict[str, Any]],
+    report: Report,
+) -> None:
+    routes = _validate_route_set(spec, expected_scope, state, report)
+    selected_route_id = _validate_human_selected_route(spec, routes, expected_scope, state, report)
+    _validate_art_direction(spec, selected_route_id, state, report)
+    _validate_production_controls(spec, expected_scope, template_entries, state, report)
+    _validate_page_contract(spec, spec.get("source_packet"), state, report)
+
+    required = _anti_slop_route_required(spec, state)
+    audit = spec.get("anti_slop_audit")
+    if audit is None and not required:
+        return
+    if not isinstance(audit, dict):
+        report.error("anti_slop_audit_required", "$.anti_slop_audit", "Canva mutation/final states require an explainable anti_slop_audit.")
+        return
+    audit_status = audit.get("status")
+    if not isinstance(audit_status, str) or audit_status not in {"pending", "pass", "fail"}:
+        report.error("anti_slop_audit_status", "$.anti_slop_audit.status", "Anti-slop audit status must be pending, pass, or fail.")
+    if required and audit_status != "pass":
+        report.error("anti_slop_audit_incomplete", "$.anti_slop_audit.status", "Canva mutation/final states require a passing anti-slop audit.")
+
+    reason_codes = audit.get("reason_codes", [])
+    if not isinstance(reason_codes, list) or any(
+        not isinstance(code, str)
+        or (code not in ANTI_SLOP_REASON_CODES and not ANTI_SLOP_REASON_CODE_RE.fullmatch(code))
+        for code in reason_codes
+    ):
+        report.error("anti_slop_reason_codes", "$.anti_slop_audit.reason_codes", "Reason codes must be explainable anti-slop findings, never detector scores.")
+    findings = audit.get("findings", [])
+    if not isinstance(findings, list):
+        report.error("anti_slop_findings", "$.anti_slop_audit.findings", "Anti-slop findings must be a list.")
+    else:
+        for index, finding in enumerate(findings):
+            path = f"$.anti_slop_audit.findings[{index}]"
+            if not isinstance(finding, dict):
+                report.error("anti_slop_finding", path, "Each finding must explain a reason, dimension, and location.")
+                continue
+            code = finding.get("reason_code", finding.get("code"))
+            if not isinstance(code, str) or (
+                code not in ANTI_SLOP_REASON_CODES and not ANTI_SLOP_REASON_CODE_RE.fullmatch(code)
+            ):
+                report.error("anti_slop_reason_code", f"{path}.reason_code", "Finding reason_code must be explainable and registered.")
+            if not _nonempty_string(finding.get("dimension")) or not _nonempty_string(finding.get("explanation", finding.get("message"))):
+                report.error("anti_slop_finding_explanation", path, "Findings require a dimension and explainable message.")
+
+    slop_index = audit.get("slop_index")
+    if not isinstance(slop_index, dict):
+        report.error("slop_index", "$.anti_slop_audit.slop_index", "slop_index must contain five dimensions scored from 0 to 5.")
+        slop_index = {}
+    for dimension in ANTI_SLOP_SLOP_DIMENSIONS:
+        score = slop_index.get(dimension)
+        if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 5:
+            report.error("slop_index_dimension", f"$.anti_slop_audit.slop_index.{dimension}", "Each slop dimension must be an integer from 0 to 5.")
+
+    rubric = audit.get("rubric")
+    if not isinstance(rubric, dict):
+        report.error("rubric", "$.anti_slop_audit.rubric", "Anti-slop audit requires a 100-point dimension rubric.")
+        rubric = {}
+    score_total = 0
+    for dimension, weight in ANTI_SLOP_RUBRIC_WEIGHTS.items():
+        value = rubric.get(dimension, (rubric.get("scores") or {}).get(dimension) if isinstance(rubric.get("scores"), dict) else None)
+        score = value.get("score") if isinstance(value, dict) else value
+        maximum = value.get("max", weight) if isinstance(value, dict) else weight
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= weight:
+            report.error("rubric_score", f"$.anti_slop_audit.rubric.{dimension}", f"Rubric score must be between 0 and its {weight}-point weight.")
+        if maximum != weight:
+            report.error("rubric_weight", f"$.anti_slop_audit.rubric.{dimension}", f"Rubric dimension weight must remain {weight} points.")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            score_total += score
+    rubric_total = rubric.get("total")
+    if not isinstance(rubric_total, (int, float)) or isinstance(rubric_total, bool) or rubric_total != score_total:
+        report.error("rubric_total", "$.anti_slop_audit.rubric.total", "Rubric total must equal the sum of the seven weighted dimensions and stay within 100 points.")
+    elif rubric_total > 100:
+        report.error("rubric_total", "$.anti_slop_audit.rubric.total", "Rubric total cannot exceed 100 points.")
+    if required and isinstance(rubric_total, (int, float)) and rubric_total < 80:
+        report.error("rubric_threshold", "$.anti_slop_audit.rubric.total", "Production/final content requires at least 80/100 and no hard blocker.")
+
+    evidence = audit.get("evidence")
+    if not isinstance(evidence, dict):
+        report.error("anti_slop_evidence", "$.anti_slop_audit.evidence", "Anti-slop audit requires OCR, layout, semantic, WCAG, rights, and similarity evidence.")
+        evidence = {}
+    for key in ANTI_SLOP_EVIDENCE_KEYS:
+        path = f"$.anti_slop_audit.evidence.{key}"
+        evidence_value = evidence.get(key)
+        if evidence_value is None:
+            evidence_value = evidence.get(
+                {
+                    "ocr": "ocr_exact_match",
+                    "layout": "layout_checks",
+                    "semantic": "semantic_contract",
+                    "wcag": "wcag_contrast",
+                    "rights": "rights_provenance",
+                    "recent_similarity": "similarity",
+                }[key]
+            )
+        status = _validate_evidence_status(evidence_value, path, report)
+        if required and (not isinstance(evidence_value, dict) or status != "pass"):
+            report.error("anti_slop_evidence_block", path, "Canva mutation/final states require structured passing evidence for every quality gate.")
+        if required and isinstance(evidence_value, dict):
+            if _parse_datetime(evidence_value.get("checked_at", evidence_value.get("timestamp"))) is None:
+                report.error("anti_slop_evidence_timestamp", path, "Required evidence needs a timezone-aware checked_at timestamp.")
+            if not isinstance(evidence_value.get("page_refs", evidence_value.get("render_refs", [])), list) or not evidence_value.get("page_refs", evidence_value.get("render_refs", [])):
+                report.error("anti_slop_evidence_refs", path, "Required evidence needs non-empty page or render references.")
+        if key == "ocr" and isinstance(evidence_value, dict) and status == "pass" and evidence_value.get("exact_match") is not True:
+            report.error("ocr_exact_match", path, "OCR evidence must explicitly record exact_match true.")
+        if key == "layout" and isinstance(evidence_value, dict) and status == "pass":
+            if evidence_value.get("overflow") not in (False, "none") or evidence_value.get("overlap") not in (False, "none"):
+                report.error("layout_evidence_incomplete", path, "Passing layout evidence must explicitly record overflow=false and overlap=false.")
+            if evidence_value.get("overflow") is True or evidence_value.get("overlap") is True:
+                report.error("layout_blocker", path, "Layout evidence cannot pass with overflow or collision.")
+        if key == "semantic" and isinstance(evidence_value, dict) and status == "pass":
+            checks = evidence_value.get("contract_tests", evidence_value.get("checks"))
+            if not isinstance(checks, list) or not checks:
+                report.error("semantic_evidence_incomplete", path, "Passing semantic evidence must list object/count/color/relation/CTA contract checks.")
+        if key == "rights" and isinstance(evidence_value, dict) and status == "pass":
+            if not isinstance(evidence_value.get("assets"), list) and not isinstance(evidence_value.get("provenance"), list):
+                report.error("rights_evidence_incomplete", path, "Passing rights evidence must list asset provenance or an explicit empty assets list.")
+        if key == "recent_similarity" and isinstance(evidence_value, dict) and status == "pass":
+            if not isinstance(evidence_value.get("threshold"), (int, float)) and not isinstance(evidence_value.get("similarity_checks"), list):
+                report.error("similarity_evidence_incomplete", path, "Passing similarity evidence must record a threshold or similarity checks.")
+        if key == "wcag" and isinstance(evidence_value, dict) and status == "pass":
+            if evidence_value.get("contrast_pass") is not True:
+                report.error("wcag_contrast", path, "WCAG evidence must explicitly record contrast_pass true.")
+    independent = audit.get("independent_critique", spec.get("independent_critique"))
+    if not isinstance(independent, dict):
+        if required:
+            report.error("independent_critique_missing", "$.anti_slop_audit.independent_critique", "Final content requires an independent visual critique.")
+    else:
+        if required and independent.get("status") != "pass":
+            report.error("independent_critique_status", "$.anti_slop_audit.independent_critique.status", "Independent critique must pass before final states.")
+        if not _nonempty_string(independent.get("reviewer_id")):
+            report.error("independent_critique_reviewer", "$.anti_slop_audit.independent_critique.reviewer_id", "Independent critique requires a reviewer ID.")
+        if independent.get("independent_from_generation") is not True:
+            report.error("independent_critique_independence", "$.anti_slop_audit.independent_critique.independent_from_generation", "Critique must be independently performed.")
+
+    blockers = audit.get("hard_blockers")
+    if not isinstance(blockers, dict):
+        report.error("hard_blockers", "$.anti_slop_audit.hard_blockers", "Hard blockers must be recorded as pass/fail evidence.")
+    else:
+        if required and set(blockers) != ANTI_SLOP_HARD_BLOCKER_KEYS:
+            report.error("hard_blocker_keys", "$.anti_slop_audit.hard_blockers", "Final states require the complete allowlisted hard-blocker key set.")
+        for code, status in blockers.items():
+            if isinstance(status, str) and not required and status in {"pass", "fail", "pending"}:
+                continue
+            if not isinstance(status, dict) or status.get("status") not in {"pass", "fail", "pending"} or not _nonempty_string(status.get("evidence", status.get("reason"))):
+                report.error("hard_blocker", f"$.anti_slop_audit.hard_blockers.{code}", "Each hard blocker needs typed status and evidence.")
+            elif required and status.get("status") != "pass":
+                report.error("hard_blocker", f"$.anti_slop_audit.hard_blockers.{code}", "Canva mutation/final states fail closed on any unresolved hard blocker.")
+            elif code not in ANTI_SLOP_HARD_BLOCKER_KEYS:
+                report.error("hard_blocker_key", f"$.anti_slop_audit.hard_blockers.{code}", "Unknown hard-blocker key.")
+
+    package = audit.get("approval_package")
+    if required:
+        if not isinstance(package, dict):
+            report.error("approval_package_missing", "$.anti_slop_audit.approval_package", "Final content requires a scoped approval package and checksum evidence.")
+        else:
+            _validate_anti_scope(package.get("scope"), "$.anti_slop_audit.approval_package.scope", expected_scope, report, required=True)
+            if package.get("content_id") != spec.get("content_id"):
+                report.error("approval_package_content", "$.anti_slop_audit.approval_package.content_id", "Approval package content_id must match the content record.")
+            export_checksum = spec.get("design", {}).get("export_checksum") if isinstance(spec.get("design"), dict) else None
+            if package.get("export_checksum") != export_checksum:
+                report.error("approval_package_export", "$.anti_slop_audit.approval_package.export_checksum", "Approval package must bind the exact export checksum.")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(package.get("render_digest"))):
+                report.error("approval_package_render", "$.anti_slop_audit.approval_package.render_digest", "Approval package requires a sha256 render digest.")
+            expected_package_checksum = _anti_slop_package_checksum(spec, audit)
+            if package.get("checksum") != expected_package_checksum:
+                report.error("anti_slop_package_checksum", "$.anti_slop_audit.approval_package.checksum", "Approval package checksum does not match route, audit, render, and export evidence.")
     elif isinstance(value, str) and re.search(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", value):
         report.error("secret_value", path, "A bearer-token-like value is forbidden in content records.")
 
@@ -1208,6 +2063,15 @@ def calculate_package_checksum(spec: dict[str, Any]) -> str | None:
         "template_id": design.get("template_id"),
         "template_version": design.get("template_version"),
         "provider_template_id": _provider_template_id_value(design),
+        # Anti-slop route selection and audit package are part of the exact
+        # artifact approval.  A changed route/audit must require re-approval.
+        "human_selected_route": _route_id_from_selection(spec.get("human_selected_route")),
+        "anti_slop_package_checksum": (
+            spec.get("anti_slop_audit", {}).get("approval_package", {}).get("checksum")
+            if isinstance(spec.get("anti_slop_audit"), dict)
+            and isinstance(spec.get("anti_slop_audit", {}).get("approval_package"), dict)
+            else None
+        ),
         "caption": spec.get("caption"),
         "alt_text": spec.get("alt_text"),
         "target_account": publishing.get("target_account"),
@@ -1437,6 +2301,7 @@ def validate_content_spec(
         return report
 
     _scan_for_secrets(spec, report)
+    _scan_for_universal_detector_fields(spec, report)
     missing = sorted(REQUIRED_TOP_LEVEL - spec.keys())
     for key in missing:
         report.error("missing_field", f"$.{key}", "Required top-level field is missing.")
@@ -1498,6 +2363,7 @@ def validate_content_spec(
         report.error("brand_mismatch", "$.brand_id", f"Content brand_id must match {brand_id!r}.")
 
     template_entries = _validate_template_registry(spec, canonical_scope, policy, report, today)
+    _validate_source_packet_and_brief(spec, canonical_scope, state, report)
 
     source_context = spec.get("source_context")
     if not isinstance(source_context, dict):
@@ -1745,12 +2611,23 @@ def validate_content_spec(
             value = design.get(key)
             if value is not None and not _valid_https_url(value):
                 report.error("design_url", f"$.design.{key}", "Design URL must be HTTPS or null.")
+        local_handoff = design.get("local_handoff")
+        has_local_handoff = isinstance(local_handoff, dict) and _nonempty_string(local_handoff.get("handoff_ref")) and local_handoff.get("status") in {"ready", "accepted"}
         if _state_at_least(state, "DESIGN_DRAFT") and not any(
             _nonempty_string(design.get(key)) for key in ("draft_ref", "canva_design_id", "canva_design_url")
-        ):
+        ) and not has_local_handoff:
             report.error("draft_evidence", "$.design", "Design draft state requires a draft or Canva reference.")
-        if _state_at_least(state, "BRAND_QA") and not _nonempty_string(design.get("render_ref")):
-            report.error("render_evidence", "$.design.render_ref", "Brand QA requires an actual render reference.")
+        if has_local_handoff:
+            _validate_remote_scope(local_handoff.get("scope"), "$.design.local_handoff.scope", canonical_scope, report, required=True)
+        if _state_at_least(state, "BRAND_QA"):
+            render_evidence = design.get("render_evidence")
+            if (not isinstance(render_evidence, dict) or not _nonempty_string(render_evidence.get("render_ref")) or
+                not re.fullmatch(r"sha256:[0-9a-f]{64}", str(render_evidence.get("render_digest"))) or
+                render_evidence.get("verification_status") != "verified" or
+                render_evidence.get("provider") not in {"canva", "local_renderer"} or
+                render_evidence.get("receipt_digest") != render_evidence.get("render_digest") or
+                not _nonempty_string(render_evidence.get("receipt_id"))):
+                report.error("render_evidence", "$.design.render_evidence", "Brand QA requires typed render_ref and render_digest evidence.")
         export_checksum = design.get("export_checksum")
         if export_checksum is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(export_checksum)):
             report.error("export_checksum", "$.design.export_checksum", "Use sha256:<64 lowercase hex characters>.")
@@ -1873,8 +2750,13 @@ def validate_content_spec(
         report.error("qa", "$.qa", "qa must be an object.")
     else:
         for key in qa_keys:
-            if qa.get(key) not in QA_STATUSES:
+            item = qa.get(key)
+            status = item.get("status") if isinstance(item, dict) else item
+            if status not in QA_STATUSES:
                 report.error("qa_status", f"$.qa.{key}", "Unsupported QA status.")
+            if _state_at_least(state, "HUMAN_APPROVED") and isinstance(item, dict):
+                if _parse_datetime(item.get("checked_at")) is None or not isinstance(item.get("page_refs"), list) or not item.get("page_refs"):
+                    report.error("qa_evidence", f"$.qa.{key}", "Final QA requires checked_at and non-empty page_refs.")
         if not isinstance(qa.get("notes"), list):
             report.error("qa_notes", "$.qa.notes", "qa.notes must be a list.")
         if _state_at_least(state, "HUMAN_APPROVED"):
@@ -1882,7 +2764,8 @@ def validate_content_spec(
                 allowed = {"pass"}
                 if spec.get("format") == "text" and key in {"visual", "mobile_thumbnail"}:
                     allowed.add("not_applicable")
-                if qa.get(key) not in allowed:
+                status = qa.get(key).get("status") if isinstance(qa.get(key), dict) else qa.get(key)
+                if status not in allowed:
                     report.error("qa_not_passed", f"$.qa.{key}", "Approved packages require completed passing QA.")
 
     publishing = spec.get("publishing")
@@ -2046,6 +2929,7 @@ def validate_content_spec(
                 report.error("approval_missing", "$.approval.status", "Lifecycle state requires an approved human decision.")
 
     _validate_measurement(spec, spec.get("measurement"), state, published_at, report)
+    _validate_anti_slop_audit(spec, canonical_scope, state, template_entries, report)
 
     return report
 
@@ -2083,7 +2967,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         spec = _load_json(args.content_spec)
         brand = _load_json(args.brand) if args.brand else None
-        policy_context = _load_json(args.policy) if args.policy else None
+        policy_context = load_trusted_policy(args.policy) if args.policy else None
         brand_policy_context = _load_json(args.brand_policy) if args.brand_policy else None
     except (OSError, json.JSONDecodeError) as exc:
         payload = {"valid": False, "summary": {"errors": 1, "warnings": 0}, "issues": [{"severity": "error", "code": "input", "path": "$", "message": str(exc)}]}
