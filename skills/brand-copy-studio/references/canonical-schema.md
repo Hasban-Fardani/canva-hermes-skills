@@ -113,6 +113,21 @@ legacy drafts remain readable:
   `publisher`;
 - `feedback_reason_codes`: an object containing the exact bundle scope and a
   `codes` array of stable uppercase reason codes, dimensions, and descriptions.
+- `situation_patterns`, `audience_moments`, and `observable_behaviors`: the
+  moments and actions that make an audience situation concrete;
+- `concrete_proof_details`: details that may be used only when their source
+  and rights are available;
+- `brand_stance`, `right_to_speak`, and `what_we_refuse_to_say`: the position,
+  authority boundary, and deliberate exclusions behind the voice;
+- `voice_as_behavior`: observable writing behavior, not adjectives such as
+  “warm” or “bold”;
+- `approved_verbal_assets` and `owned_vocabulary`: supplied, approved terms
+  and verbal assets rather than invented slogans;
+- `locale_policy`: default Indonesian locale, evidence-backed code-switching or
+  slang rules, and any EYD/KBBI handling;
+- `fake_intimacy_policy` and `unsupported_first_person_policy`: explicit
+  constraints against invented diary voice, testimonials, or ungrounded “we/I”
+  experience.
 
 Each creative-contract record carries `id`, a non-empty text/value field,
 `evidence_status`, and `source_ids`. A distinctive asset additionally requires

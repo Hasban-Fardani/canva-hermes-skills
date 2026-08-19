@@ -134,7 +134,10 @@ An optional product overlay lives at
 `<hermes-data-root>/social-content/brands/<tenant>/<client>/<brand>/products/<product>/brand-profile.json`.
 The master profile has a null or absent `product_id` and may serve products
 within the same tenant/client; an overlay must match the content `product_id`
-and carry `parent_brand_revision`. Before consuming one, the complete
+and carry `parent_brand_revision`. For privileged overlay validation, supply
+the independently loaded master bundle at runtime (`--master-brand-bundle` in
+the validator CLI); never use the overlay's own parent value or a raw revision
+flag as the expected authority. Before consuming one, the complete
 four-file bundle in the scoped directory must have been validated by
 `brand-copy-studio`; this skill performs only profile-level compatibility and
 rights checks. Canonical `draft` profiles remain warnings, `active` profiles
@@ -313,3 +316,8 @@ The export helper is [scripts/download_canva_export.py](scripts/download_canva_e
 its unit suite is [scripts/test_download_canva_export.py](scripts/test_download_canva_export.py).
 The content validator is [scripts/validate_content_spec.py](scripts/validate_content_spec.py),
 with tests in [scripts/test_validate_content_spec.py](scripts/test_validate_content_spec.py).
+
+Before Canva mutation, provide a `human_copy_brief` covering observable
+situation, audience tension, point of view, concrete proof, creative route, and
+message jobs. Record contextual `copy_quality_audit` findings with registered
+reason codes; this is an explainable editorial gate, never an authorship detector.

@@ -91,6 +91,12 @@ ANTI_SLOP_LIST_FIELDS = (
     "visual_principles",
     "composition_rules",
     "avoid_patterns",
+    "situation_patterns",
+    "audience_moments",
+    "observable_behaviors",
+    "concrete_proof_details",
+    "approved_verbal_assets",
+    "owned_vocabulary",
 )
 ANTI_SLOP_REQUIRED_FIELDS = (
     *ANTI_SLOP_LIST_FIELDS,
@@ -99,6 +105,13 @@ ANTI_SLOP_REQUIRED_FIELDS = (
     "model_usage_policy",
     "approval_roles",
     "feedback_reason_codes",
+    "brand_stance",
+    "right_to_speak",
+    "what_we_refuse_to_say",
+    "voice_as_behavior",
+    "locale_policy",
+    "fake_intimacy_policy",
+    "unsupported_first_person_policy",
 )
 ANTI_SLOP_TEXT_ALIASES = {
     "audience_situations": ("situation", "value", "description"),
@@ -107,6 +120,12 @@ ANTI_SLOP_TEXT_ALIASES = {
     "visual_principles": ("principle", "value", "description"),
     "composition_rules": ("rule", "value", "description"),
     "avoid_patterns": ("pattern", "value", "description"),
+    "situation_patterns": ("situation", "value", "description"),
+    "audience_moments": ("moment", "value", "description"),
+    "observable_behaviors": ("behavior", "value", "description"),
+    "concrete_proof_details": ("detail", "proof", "value", "description"),
+    "approved_verbal_assets": ("asset", "term", "value", "description"),
+    "owned_vocabulary": ("term", "value", "description"),
 }
 ANTI_SLOP_REASON_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ANTI_SLOP_APPROVAL_ROLES = {"lead", "admin", "reviewer", "publisher"}
@@ -473,6 +492,42 @@ def _validate_anti_slop_contract(
                 rights = _validate_rights(record.get("rights"), f"{item_location}.rights", errors, required=True)
                 if privileged and rights is not None and rights.get("status") not in APPROVED_RIGHTS:
                     errors.append(f"{item_location}: distinctive asset rights must be approved or exact for privileged states")
+
+    for field, aliases in {
+        "brand_stance": ("stance", "value", "description"),
+        "right_to_speak": ("right", "value", "description"),
+        "what_we_refuse_to_say": ("refusal", "value", "description"),
+        "voice_as_behavior": ("behavior", "value", "description"),
+    }.items():
+        record = fields.get(field)
+        location = f"brand-profile.json.{field}"
+        if record is None:
+            if privileged:
+                errors.append(f"{location}: required for privileged states")
+            continue
+        if _validate_evidence_text_record(record, location, aliases, record_locations, privileged, errors) and isinstance(record, dict):
+            source_refs.append((location, _validate_string_list(record.get("source_ids"), f"{location}.source_ids", errors)))
+            _validate_record_scope(record.get("scope"), f"{location}.scope", expected_scope, errors)
+
+    for field in ("locale_policy", "fake_intimacy_policy", "unsupported_first_person_policy"):
+        value = fields.get(field)
+        location = f"brand-profile.json.{field}"
+        if value is None:
+            if privileged:
+                errors.append(f"{location}: required for privileged states")
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"{location}: must be an object")
+            continue
+        _require_fields(value, ("rule", "evidence_status", "source_ids"), location, errors)
+        if not _is_nonempty_string(value.get("rule")):
+            errors.append(f"{location}.rule: must be a non-empty string")
+        _validate_evidence_record(value, location, errors)
+        if privileged and value.get("evidence_status") not in APPROVED_EVIDENCE:
+            errors.append(f"{location}: privileged policy requires exact or observed status")
+        if privileged and isinstance(value.get("source_ids"), list) and not value.get("source_ids"):
+            errors.append(f"{location}: privileged policy requires non-empty source_ids")
+        source_refs.append((location, _validate_string_list(value.get("source_ids"), f"{location}.source_ids", errors)))
 
     tension = fields.get("strategic_tension")
     if tension is None:
@@ -1152,6 +1207,18 @@ def validate_brand_bundle(
                         for index, record in enumerate(records)
                         if isinstance(record, dict)
                     )
+        for field in (
+            "brand_stance",
+            "right_to_speak",
+            "what_we_refuse_to_say",
+            "voice_as_behavior",
+            "locale_policy",
+            "fake_intimacy_policy",
+            "unsupported_first_person_policy",
+        ):
+            record = anti_slop_fields.get(field)
+            if isinstance(record, dict):
+                observed_records.append((f"brand-profile.json.{field}", record))
         for location, record in observed_records:
             if record.get("evidence_status") == "exact":
                 errors.append(f"{location}: observe operation requires observed, inferred, or unverified evidence")

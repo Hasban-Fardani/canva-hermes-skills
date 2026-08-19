@@ -117,6 +117,11 @@ content-production skill after a local brand snapshot exists.
     human proof points, positive/negative voice examples, distinctive assets,
     visual principles, composition rules, avoid patterns, model-use policy,
     approval roles, and scoped feedback reason codes in the brand profile.
+    Also capture a Human Copy Brief: audience moments and observable behavior,
+    brand stance/right-to-speak, what the brand refuses to say, concrete proof
+    details, voice as behavior, approved verbal assets/owned vocabulary,
+    Indonesian locale and code-switch policy, and fake-intimacy or unsupported
+    first-person constraints.
     Drafts may leave these fields incomplete; `active` and approved registry
     records may not.
 

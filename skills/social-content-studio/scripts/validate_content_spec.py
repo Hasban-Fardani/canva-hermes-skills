@@ -84,6 +84,11 @@ ANTI_SLOP_REASON_CODES = {
     "independent_critique_missing",
     "approval_package_missing",
 }
+COPY_QUALITY_REASON_CODES = {
+    "ABSTRACT_WITHOUT_SCENE", "NEGATION_INSIGHT_WITHOUT_EVIDENCE", "FAKE_INTIMACY_WITHOUT_PROVENANCE",
+    "GENERIC_MOTIVATIONAL_CLOSURE", "DECORATIVE_SAVE_CTA", "PARAPHRASE_NO_PROGRESS",
+    "INTERCHANGEABLE_BRAND_COPY", "UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM",
+}
 ANTI_SLOP_REASON_CODE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,63}")
 ANTI_SLOP_SLOP_DIMENSIONS = (
     "generic_language",
@@ -523,7 +528,7 @@ def _validate_policy(spec: dict[str, Any], expected_scope: dict[str, str] | None
         if role not in POLICY_ROLES:
             report.error("role_mapping_role", f"$.policy.role_mapping.{role}", "Unsupported role in role_mapping.")
         if not isinstance(identities, list) or any(
-            not _nonempty_string(identity) or identity in {"*", "any", "prompt"} for identity in identities
+            not _nonempty_string(identity) or identity in {"*", "any", "prompt", "all", "everyone"} for identity in identities
         ):
             report.error("role_mapping_identity", f"$.policy.role_mapping.{role}", "Each mapped role must contain explicit identity IDs; an empty role list is allowed until that role is needed.")
     if _nonempty_string(actor_id) and actor_role in POLICY_ROLES and not _mapped_identity(raw, actor_id, actor_role):
@@ -645,7 +650,7 @@ def _validate_trusted_policy(
         report.error("trusted_policy_source", "$policy.source", "Trusted policy source must be local_authenticated_policy.")
     if policy_context.get("schema_version") != "1.0":
         report.error("trusted_policy_schema", "$policy.schema_version", "Trusted policy schema_version must be 1.0.")
-    for key in ("policy_id", "revision"):
+    for key in ("policy_id", "revision", "actor_id", "actor_role", "identity_source"):
         if not _nonempty_string(policy_context.get(key)):
             report.error("trusted_policy_metadata", f"$policy.{key}", "Trusted policy requires policy_id and revision.")
     expected_policy_scope = {
@@ -701,6 +706,13 @@ def _validate_trusted_policy(
             report.error("trusted_actor_required", "$policy", "Privileged validation requires the current authenticated actor from runtime, not the content record.")
     elif isinstance(policy_context.get("actor_id"), str) and policy_context.get("actor_id") != runtime_actor_id:
         report.error("trusted_policy_actor", "$policy.actor_id", "The runtime actor must exactly match the actor in the trusted policy receipt.")
+    if policy_context.get("identity_source") not in IDENTITY_SOURCES:
+        report.error("trusted_policy_identity_source", "$policy.identity_source", "Trusted policy identity_source must be an authenticated source.")
+    if policy_context.get("actor_role") not in POLICY_ROLES:
+        report.error("trusted_policy_actor_role", "$policy.actor_role", "Trusted policy actor_role must be an allowlisted role.")
+    mapping = policy_context.get("role_mapping")
+    if isinstance(mapping, dict) and policy_context.get("actor_id") not in mapping.get(policy_context.get("actor_role"), []):
+        report.error("trusted_policy_actor_membership", "$policy.role_mapping", "Trusted actor must be explicitly listed in the trusted role mapping.")
     if privileged and isinstance(embedded.get("actor_id"), str):
         approval = spec.get("approval")
         publishing = spec.get("publishing")
@@ -722,7 +734,7 @@ def _validate_trusted_policy(
     mapping = policy_context.get("role_mapping")
     if isinstance(mapping, dict):
         for role, identities in mapping.items():
-            if role not in POLICY_ROLES or not isinstance(identities, list) or any(identity in {"*", "any", "prompt"} for identity in identities):
+            if role not in POLICY_ROLES or not isinstance(identities, list) or any(identity in {"*", "any", "prompt", "all", "everyone"} for identity in identities):
                 report.error("trusted_policy_roles", "$policy.role_mapping", "Trusted role mapping may not contain wildcard or prompt identities.")
 
 
@@ -775,6 +787,117 @@ def _read_brand_bundle_documents(root: Path, report: Report) -> dict[str, dict[s
     return documents if len(documents) == len(BRAND_BUNDLE_FILES) else None
 
 
+def _validate_master_brand_bundle(
+    master_brand_bundle: str | Path,
+    expected_scope: dict[str, str] | None,
+    validator: Any,
+    brand_policy_context: Any,
+    brand_actor_id: str | None,
+    report: Report,
+) -> str | None:
+    """Load a canonical master bundle and return its independently read revision."""
+
+    root = Path(master_brand_bundle).expanduser()
+    if not root.is_dir():
+        report.error("master_brand_bundle_path", "$master_brand_bundle", "Master Brand Copy bundle directory does not exist.")
+        return None
+    documents = _read_brand_bundle_documents(root, report)
+    if documents is None:
+        return None
+
+    profile = documents["brand-profile.json"]
+    profile_scope = profile.get("scope") if isinstance(profile.get("scope"), dict) else {}
+    for field in ("tenant_id", "client_id", "product_id", "parent_brand_revision"):
+        if field in profile and field in profile_scope and profile.get(field) != profile_scope.get(field):
+            report.error(
+                "master_brand_bundle_scope_conflict",
+                f"$master_brand_bundle/brand-profile.json.scope.{field}",
+                "Master Brand Copy top-level and nested scope fields must agree exactly.",
+            )
+
+    master_product = profile_scope.get("product_id", profile.get("product_id"))
+    master_parent_revision = profile_scope.get("parent_brand_revision", profile.get("parent_brand_revision"))
+    if master_product not in (None, ""):
+        report.error(
+            "master_brand_bundle_product",
+            "$master_brand_bundle/brand-profile.json.scope.product_id",
+            "The runtime master Brand Copy bundle must have a null product_id.",
+        )
+    if master_parent_revision not in (None, ""):
+        report.error(
+            "master_brand_bundle_parent",
+            "$master_brand_bundle/brand-profile.json.scope.parent_brand_revision",
+            "A runtime master Brand Copy bundle must not carry parent_brand_revision.",
+        )
+    if expected_scope and (
+        profile_scope.get("tenant_id", profile.get("tenant_id")) != expected_scope.get("tenant_id")
+        or profile_scope.get("client_id", profile.get("client_id")) != expected_scope.get("client_id")
+        or profile.get("brand_id") != expected_scope.get("brand_id")
+    ):
+        report.error(
+            "master_brand_bundle_scope",
+            "$master_brand_bundle",
+            "Master Brand Copy bundle tenant, client, and brand must match the content isolation scope.",
+        )
+    if profile.get("status") != "active":
+        report.error(
+            "master_brand_bundle_status",
+            "$master_brand_bundle/brand-profile.json.status",
+            "A privileged product overlay requires an active master Brand Copy bundle.",
+        )
+    revision = profile.get("revision")
+    if not _nonempty_string(revision):
+        report.error(
+            "master_brand_bundle_revision",
+            "$master_brand_bundle/brand-profile.json.revision",
+            "The master Brand Copy profile must carry a non-empty canonical revision.",
+        )
+        revision = None
+
+    if validator is not None:
+        # An overlay Brand policy is product-scoped and cannot authorize a
+        # master scope. When no master-scoped policy context was supplied, the
+        # sibling validator still provides structural/evidence validation; the
+        # overlay's separate Brand authority remains required for privileged
+        # consumption below.
+        master_policy = None
+        master_actor_id = None
+        if brand_policy_context is not None and hasattr(brand_policy_context, "as_mapping"):
+            candidate = brand_policy_context.as_mapping()
+            candidate_scope = candidate.get("scope") if isinstance(candidate, dict) else None
+            if isinstance(candidate_scope, dict) and candidate_scope.get("product_id") in (None, ""):
+                master_policy = brand_policy_context
+                master_actor_id = brand_actor_id
+        expected_master_scope = {
+            "tenant_id": expected_scope.get("tenant_id") if expected_scope else None,
+            "client_id": expected_scope.get("client_id") if expected_scope else None,
+            "product_id": None,
+            "parent_brand_revision": None,
+        }
+        try:
+            master_errors = validator.validate_brand_bundle(
+                root,
+                expected_brand_id=expected_scope.get("brand_id") if expected_scope else None,
+                expected_scope=expected_master_scope,
+                policy=master_policy,
+                actor_id=master_actor_id,
+            )
+        except (AttributeError, TypeError, OSError, ValueError) as exc:
+            master_errors = [f"validator invocation failed: {exc}"]
+        authority_only = (
+            "external trusted local access policy",
+            "external access policy scope",
+            "requires trusted runtime actor_id",
+            "requires external policy scope and actor match",
+            "authorization actor_id and role are not mapped by external access policy",
+        )
+        for error in master_errors:
+            if master_policy is None and any(marker in str(error) for marker in authority_only):
+                continue
+            report.error("master_brand_bundle_invalid", "$master_brand_bundle", str(error))
+    return revision if isinstance(revision, str) else None
+
+
 def _validate_brand_bundle(
     brand_bundle: str | Path | None,
     expected_scope: dict[str, str] | None,
@@ -784,6 +907,7 @@ def _validate_brand_bundle(
     *,
     brand_policy_context: Any = None,
     brand_actor_id: str | None = None,
+    master_brand_bundle: str | Path | None = None,
 ) -> dict[str, Any] | None:
     """Validate an external four-file Brand Copy bundle for privileged use."""
 
@@ -844,6 +968,38 @@ def _validate_brand_bundle(
     ):
         report.error("brand_bundle_scope", "$brand_bundle", "Brand Copy bundle tenant, client, and brand must match the content isolation scope.")
 
+    product_overlay = bundle_product is not None
+    validator = _load_brand_bundle_validator()
+    trusted_parent_revision = None
+    if privileged and product_overlay:
+        if master_brand_bundle is None:
+            report.error(
+                "brand_master_bundle_required",
+                "$master_brand_bundle",
+                "Privileged product overlays require an independently supplied master Brand Copy bundle.",
+            )
+        elif validator is None:
+            report.error(
+                "brand_bundle_validator",
+                "$master_brand_bundle",
+                "The sibling Brand Copy bundle validator is unavailable; fail closed for privileged use.",
+            )
+        else:
+            trusted_parent_revision = _validate_master_brand_bundle(
+                master_brand_bundle,
+                expected_scope,
+                validator,
+                brand_policy_context,
+                brand_actor_id,
+                report,
+            )
+        if trusted_parent_revision is not None and bundle_scope["parent_brand_revision"] != trusted_parent_revision:
+            report.error(
+                "brand_master_revision_mismatch",
+                "$brand_bundle/brand-profile.json.scope.parent_brand_revision",
+                "Product overlay parent_brand_revision must exactly match the canonical revision from the independently loaded master Brand Copy bundle.",
+            )
+
     requires_brand_authority = privileged and (has_claims or has_recipe or policy.get("mode") == "unattended")
     brand_authority_missing = requires_brand_authority and (
         brand_policy_context is None or not _nonempty_string(brand_actor_id)
@@ -855,15 +1011,19 @@ def _validate_brand_bundle(
             "Privileged Brand Copy evidence requires a separately loaded brand policy and runtime brand activation actor; content policy/current actor cannot authorize it.",
         )
 
-    validator = _load_brand_bundle_validator()
     if validator is None:
         report.error("brand_bundle_validator", "$brand_bundle", "The sibling Brand Copy bundle validator is unavailable; fail closed for privileged use.")
     elif not brand_authority_missing:
+        expected_parent_revision = (
+            trusted_parent_revision
+            if product_overlay and trusted_parent_revision is not None
+            else bundle_scope["parent_brand_revision"]
+        )
         bundle_expected_scope = {
             "tenant_id": bundle_scope["tenant_id"],
             "client_id": bundle_scope["client_id"],
             "product_id": bundle_product,
-            "parent_brand_revision": bundle_scope["parent_brand_revision"],
+            "parent_brand_revision": expected_parent_revision,
         }
         try:
             errors = validator.validate_brand_bundle(
@@ -1255,6 +1415,64 @@ def _validate_source_packet_and_brief(
         report.error("creative_brief_proof_ids", "$.creative_brief.proof_ids", "Creative brief proof_ids must be a list of scoped lowercase registry IDs.")
     if isinstance(packet, dict) and isinstance(packet.get("scope"), dict) and brief.get("scope") is not None:
         _validate_anti_scope(brief.get("scope"), "$.creative_brief.scope", expected_scope, report, required=remote_or_final)
+
+
+def _validate_copy_first_gate(spec: dict[str, Any], state: Any, report: Report) -> None:
+    """Require a human-copy brief and explainable copy-quality findings before production."""
+    required = _anti_slop_route_required(spec, state)
+    brief = spec.get("human_copy_brief")
+    audit = spec.get("copy_quality_audit")
+    if brief is None and audit is None and not required:
+        return
+    if not isinstance(brief, dict):
+        if required:
+            report.error("human_copy_brief_required", "$.human_copy_brief", "Canva production requires a human copy brief before drafting.")
+        return
+    sections = {
+        "situation": ("moment", "observable_behavior"),
+        "tension": ("audience_assumption", "friction"),
+        "point_of_view": ("brand_stance", "what_we_refuse_to_say", "right_to_speak"),
+        "proof": ("concrete_details", "source_refs"),
+        "creative_route": ("visual_dependency", "distinctive_move"),
+        "message_jobs": ("headline", "body", "caption", "cta_behavior"),
+    }
+    for section, fields in sections.items():
+        value = brief.get(section)
+        if not isinstance(value, dict):
+            report.error("human_copy_brief_section", f"$.human_copy_brief.{section}", "Human Copy Brief sections must be structured objects.")
+            continue
+        for field in fields:
+            item = value.get(field)
+            valid = isinstance(item, list) and bool(item) if field in {"concrete_details", "source_refs"} else _nonempty_string(item)
+            if not valid:
+                report.error("human_copy_brief_field", f"$.human_copy_brief.{section}.{field}", "Human Copy Brief requires concrete, human-supplied message work for this field.")
+    if not isinstance(audit, dict):
+        if required:
+            report.error("copy_quality_audit_required", "$.copy_quality_audit", "Production requires an explainable copy quality audit.")
+        return
+    proof = brief.get("proof", {})
+    source_refs = proof.get("source_refs") if isinstance(proof, dict) else None
+    packet_ids = set(spec.get("source_packet", {}).get("proof_ids", [])) if isinstance(spec.get("source_packet"), dict) else set()
+    if not isinstance(source_refs, list) or not source_refs or any(ref not in packet_ids for ref in source_refs if isinstance(ref, str)):
+        report.error("copy_quality_provenance", "$.human_copy_brief.proof.source_refs", "Copy quality cannot self-attest without source references.")
+    copy_text = _all_content_text(spec).casefold()
+    unsupported_intimacy = re.search(
+        r"(?:\b(?:we|kami)\s+(?:know|understand|tahu)\s+(?:(?:exactly|persis)\s+)?"
+        r"(?:how\s+you\s+feel|what\s+you(?:'re|\s+are)\s+feeling|apa\s+yang\s+(?:anda|kamu)\s+rasakan|perasaan(?:mu|anda|kamu))\b"
+        r"|\b(?:we|kami)\s+(?:also\s+)?(?:have\s+been|experienced|juga\s+pernah\s+berada|pernah\s+berada|juga\s+mengalami|pernah\s+mengalami)\s+"
+        r"(?:there|it\s+too|in\s+(?:your\s+shoes|your\s+position)|di\s+posisi\s+(?:anda|kamu))\b)",
+        copy_text,
+    )
+    if unsupported_intimacy:
+        report.error("UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM", "$.copy_quality_audit", "Personal-experience language requires provenance and explicit approval.")
+    reasons = audit.get("reason_codes", [])
+    if not isinstance(reasons, list) or any(code not in COPY_QUALITY_REASON_CODES for code in reasons):
+        report.error("copy_quality_reason_codes", "$.copy_quality_audit.reason_codes", "Copy audit reason codes must use the registered explainable vocabulary.")
+    findings = audit.get("findings", [])
+    if not isinstance(findings, list):
+        report.error("copy_quality_findings", "$.copy_quality_audit.findings", "Copy audit findings must be a list.")
+    elif required and audit.get("status") != "pass":
+        report.error("copy_quality_status", "$.copy_quality_audit.status", "Copy quality audit must pass before Canva mutation or final states.")
 
 
 def _anti_slop_route_required(spec: dict[str, Any], state: Any) -> bool:
@@ -2292,6 +2510,7 @@ def validate_content_spec(
     brand_bundle: str | Path | None = None,
     brand_policy_context: Any = None,
     brand_actor_id: str | None = None,
+    master_brand_bundle: str | Path | None = None,
 ) -> Report:
     report = Report()
     today = today or datetime.now(timezone.utc).date()
@@ -2345,6 +2564,7 @@ def validate_content_spec(
         report,
         brand_policy_context=brand_policy_context,
         brand_actor_id=brand_actor_id,
+        master_brand_bundle=master_brand_bundle,
     )
     _validate_copy_recipe(spec, policy, state, bundle, report)
 
@@ -2929,6 +3149,7 @@ def validate_content_spec(
                 report.error("approval_missing", "$.approval.status", "Lifecycle state requires an approved human decision.")
 
     _validate_measurement(spec, spec.get("measurement"), state, published_at, report)
+    _validate_copy_first_gate(spec, state, report)
     _validate_anti_slop_audit(spec, canonical_scope, state, template_entries, report)
 
     return report
@@ -2955,6 +3176,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brand-bundle", type=Path, help="Validated Brand Copy Studio four-file bundle directory for privileged claims/recipes/unattended generation")
     parser.add_argument("--brand-policy", type=Path, help="Trusted Brand Copy local_authenticated_policy JSON path (separate from content policy)")
     parser.add_argument("--brand-actor-id", help="Trusted current Brand Copy activation identity (separate from content actor)")
+    parser.add_argument("--master-brand-bundle", type=Path, help="Independently loaded active master Brand Copy four-file bundle for privileged product overlays")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as validation failures")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Emit a machine-readable report")
     parser.add_argument("--today", type=_parse_cli_date, help="Override today's date for deterministic checks")
@@ -2968,7 +3190,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         spec = _load_json(args.content_spec)
         brand = _load_json(args.brand) if args.brand else None
         policy_context = load_trusted_policy(args.policy) if args.policy else None
-        brand_policy_context = _load_json(args.brand_policy) if args.brand_policy else None
+        if args.brand_policy:
+            brand_validator = _load_brand_bundle_validator()
+            brand_policy_context = brand_validator.TrustedAccessPolicyContext.from_file(args.brand_policy) if brand_validator is not None else None
+        else:
+            brand_policy_context = None
     except (OSError, json.JSONDecodeError) as exc:
         payload = {"valid": False, "summary": {"errors": 1, "warnings": 0}, "issues": [{"severity": "error", "code": "input", "path": "$", "message": str(exc)}]}
         print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json_output else f"ERROR input $: {exc}")
@@ -2983,6 +3209,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         brand_bundle=args.brand_bundle,
         brand_policy_context=brand_policy_context,
         brand_actor_id=args.brand_actor_id,
+        master_brand_bundle=args.master_brand_bundle,
     )
     checksum = calculate_package_checksum(spec)
     if args.json_output:

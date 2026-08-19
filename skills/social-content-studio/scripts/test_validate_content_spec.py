@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import date
 from pathlib import Path
 
@@ -16,11 +18,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from validate_content_spec import _anti_slop_package_checksum, _load_brand_bundle_validator, calculate_package_checksum, load_trusted_policy, validate_content_spec  # noqa: E402
+from validate_content_spec import _anti_slop_package_checksum, _load_brand_bundle_validator, calculate_package_checksum, load_trusted_policy, main, validate_content_spec  # noqa: E402
 
 
 TEST_EXPORT_DIR = tempfile.TemporaryDirectory(prefix="social-content-validator-")
 TEST_BRAND_BUNDLE_DIR = tempfile.TemporaryDirectory(prefix="social-content-brand-bundle-")
+TEST_INPUT_DIR = tempfile.TemporaryDirectory(prefix="social-content-validator-input-")
+MASTER_BRAND_REVISION = "2026-08-19T000000Z-r1"
 
 
 def load_json(name: str) -> dict:
@@ -28,17 +32,26 @@ def load_json(name: str) -> dict:
         return json.load(handle)
 
 
-def trusted_policy(spec: dict, *, scope_override: dict | None = None, revision_override: str | None = None, provider_override: str | None = None):
+def trusted_policy(
+    spec: dict,
+    *,
+    scope_override: dict | None = None,
+    revision_override: str | None = None,
+    provider_override: str | None = None,
+    omit_fields: tuple[str, ...] = (),
+    actor_role_override: str | None = None,
+):
     policy = spec["policy"]
     payload = {
         "schema_version": policy["schema_version"],
         "policy_id": policy["policy_id"],
         "revision": revision_override or policy["revision"],
         "source": policy["source"],
+        "identity_source": "local_authenticated_policy",
         "scope": dict(scope_override or policy["scope"]),
         "role_mapping": json.loads(json.dumps(policy["role_mapping"])),
         "actor_id": policy["actor_id"],
-        "actor_role": policy["actor_role"],
+        "actor_role": actor_role_override or policy["actor_role"],
         # The external policy fixture intentionally mirrors the complete
         # capability-bearing unattended subtree.  Partial copies are rejected
         # by the trusted-policy boundary.
@@ -46,6 +59,8 @@ def trusted_policy(spec: dict, *, scope_override: dict | None = None, revision_o
     }
     if provider_override:
         payload["unattended"]["preapproved"]["template_provider_ids"]["brand-template-001"] = provider_override
+    for field in omit_fields:
+        payload.pop(field, None)
     handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
     json.dump(payload, handle)
     handle.close()
@@ -81,29 +96,50 @@ def trusted_brand_policy(spec: dict, *, product_id: str | None = None):
     return validator.TrustedAccessPolicyContext.from_file(handle.name)
 
 
+def write_input_json(name: str, value: dict) -> Path:
+    path = Path(TEST_INPUT_DIR.name) / name
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return path
+
+
 def full_scope(spec: dict) -> dict:
     return {**spec["scope"], "brand_id": spec["brand_id"]}
 
 
-def neutral_brand_bundle(*, include_claim: bool = False) -> str:
+def neutral_brand_bundle(
+    *,
+    include_claim: bool = False,
+    product_id: str | None = None,
+    parent_brand_revision: str | None = None,
+) -> str:
     """Write a scoped, provider-neutral Brand Copy bundle fixture."""
-    root = Path(TEST_BRAND_BUNDLE_DIR.name)
+    root = Path(tempfile.mkdtemp(prefix="bundle-", dir=TEST_BRAND_BUNDLE_DIR.name))
     envelope = {
         "schema_version": "1.1",
         "brand_id": "sample-brand",
         "scope": {
             "tenant_id": "sample-tenant",
             "client_id": "sample-client",
-            "product_id": None,
-            "parent_brand_revision": None,
+            "product_id": product_id,
+            "parent_brand_revision": parent_brand_revision,
         },
-        "revision": "2026-08-19T000000Z-r1",
+        "revision": MASTER_BRAND_REVISION,
         "status": "active",
     }
     documents = {
         "brand-profile.json": {
             **envelope,
             "identity": {},
+            "brand_stance": {"id": "stance-1", "stance": "Name the next step plainly.", "evidence_status": "exact", "source_ids": ["source-1"]},
+            "concrete_proof_details": [{"id": "detail-1", "value": "A source note makes a correction traceable.", "evidence_status": "exact", "source_ids": ["source-1"]}],
+            "fake_intimacy_policy": {"rule": "Do not imply personal experience without provenance.", "status": "avoid_without_provenance", "evidence_status": "exact", "source_ids": ["source-1"]},
+            "locale_policy": {"rule": "Use Indonesian locale unless a brief approves another locale.", "default_locale": "id-ID", "allowed_locales": ["id-ID"], "evidence_status": "exact", "source_ids": ["source-1"]},
+            "observable_behaviors": [{"id": "behavior-1", "behavior": "Reader chooses one next step.", "evidence_status": "exact", "source_ids": ["source-1"]}],
+            "owned_vocabulary": [{"id": "term-1", "term": "next step", "evidence_status": "exact", "source_ids": ["source-1"]}],
+            "right_to_speak": {"id": "right-1", "right": "Speak only from supplied evidence.", "evidence_status": "exact", "source_ids": ["source-1"]},
+            "what_we_refuse_to_say": {"id": "refusal-1", "refusal": "Do not promise performance outcomes.", "evidence_status": "exact", "source_ids": ["source-1"]},
+            "voice_as_behavior": {"id": "voice-1", "behavior": "Name the next step plainly.", "evidence_status": "exact", "source_ids": ["source-1"]},
+            "unsupported_first_person_policy": {"rule": "Do not imply personal experience without provenance.", "evidence_status": "exact", "source_ids": ["source-1"]},
             "audience": {},
             "voice": [],
             "terminology": [],
@@ -114,6 +150,8 @@ def neutral_brand_bundle(*, include_claim: bool = False) -> str:
             "audience_situations": [
                 {"id": "audience-1", "situation": "A reader needs a clear next step.", "evidence_status": "exact", "source_ids": ["source-1"]}
             ],
+            "audience_moments": [{"id": "moment-1", "moment": "A reader needs a clear next step.", "evidence_status": "exact", "source_ids": ["source-1"]}],
+            "situation_patterns": [{"id": "pattern-1", "situation": "A reader needs a clear next step.", "evidence_status": "exact", "source_ids": ["source-1"]}],
             "human_proof_points": [
                 {"id": "proof-1", "proof": "A source note makes a correction traceable.", "evidence_status": "exact", "source_ids": ["source-1"]}
             ],
@@ -136,6 +174,7 @@ def neutral_brand_bundle(*, include_claim: bool = False) -> str:
                 "positive": [{"id": "voice-positive-1", "example": "Name the next step plainly.", "evidence_status": "exact", "source_ids": ["source-1"]}],
                 "negative": [{"id": "voice-negative-1", "example": "Avoid unsupported guarantees.", "evidence_status": "exact", "source_ids": ["source-1"]}]
             },
+            "approved_verbal_assets": [{"id": "asset-phrase-1", "value": "Name the next step plainly.", "status": "approved", "evidence_status": "exact", "source_ids": ["source-1"]}],
             "model_usage_policy": {
                 "allowed": ["research", "draft", "format"],
                 "restricted": ["copy"],
@@ -145,7 +184,7 @@ def neutral_brand_bundle(*, include_claim: bool = False) -> str:
             },
             "approval_roles": {"copy": ["lead"], "claims": ["lead"], "design": ["lead"], "publish": ["lead"]},
             "feedback_reason_codes": {
-                "scope": {"brand_id": "sample-brand", "tenant_id": "sample-tenant", "client_id": "sample-client", "product_id": ""},
+                "scope": {"brand_id": "sample-brand", "tenant_id": "sample-tenant", "client_id": "sample-client", "product_id": product_id or ""},
                 "codes": [{"code": "TOO_GENERIC", "dimension": "distinctiveness", "description": "Message can be exchanged with another brand."}]
             }
         },
@@ -211,7 +250,6 @@ def neutral_brand_bundle(*, include_claim: bool = False) -> str:
     for filename, document in documents.items():
         (root / filename).write_text(json.dumps(document), encoding="utf-8")
     return str(root)
-
 
 def approved_brand() -> dict:
     """Return an approved neutral fixture; never load a real brand profile."""
@@ -340,6 +378,15 @@ def make_approved_spec() -> dict:
         }
     )
     audit = spec["anti_slop_audit"]
+    spec["human_copy_brief"] = {
+        "situation": {"moment": "After the second meeting, tabs remain open.", "observable_behavior": "The reader switches tabs before opening one document."},
+        "tension": {"audience_assumption": "More tabs means more progress.", "friction": "No task is selected."},
+        "point_of_view": {"brand_stance": "Choose the next document plainly.", "what_we_refuse_to_say": "We do not promise productivity gains.", "right_to_speak": "The brief supplies the observed work moment."},
+        "proof": {"concrete_details": ["second meeting", "seven tabs"], "source_refs": ["proof-organise"]},
+        "creative_route": {"visual_dependency": "A tab strip shows the choice.", "distinctive_move": "Annotate one selected tab."},
+        "message_jobs": {"headline": "Name the document.", "body": "Close the unrelated tabs.", "caption": "Use this after a task switch.", "cta_behavior": "Save for the next task switch."},
+    }
+    spec["copy_quality_audit"] = {"status": "pass", "reason_codes": [], "findings": []}
     audit["status"] = "pass"
     audit["evidence"] = {
         "ocr": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "exact_match": True},
@@ -379,6 +426,50 @@ def make_approved_spec() -> dict:
 
 class ValidatorTests(unittest.TestCase):
     TODAY = date(2026, 8, 19)
+
+    def test_privileged_external_policy_requires_each_actor_metadata_field(self) -> None:
+        for field in ("actor_id", "actor_role", "identity_source"):
+            spec = make_approved_spec()
+            context = trusted_policy(spec, omit_fields=(field,))
+            report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
+            self.assertTrue(report.errors, field)
+
+    def test_external_actor_role_must_match_mapped_role(self) -> None:
+        spec = make_approved_spec()
+        context = trusted_policy(spec, actor_role_override="reviewer")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
+        self.assertIn("trusted_policy_actor_membership", {issue.code for issue in report.errors})
+
+    def test_trusted_policy_requires_actor_membership_and_rejects_wildcards(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"]["role_mapping"]["lead"] = ["everyone"]
+        context = trusted_policy(spec)
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
+        self.assertIn("role_mapping_identity", {i.code for i in report.errors})
+
+    def test_copy_personal_experience_requires_approved_policy_and_resolved_source(self) -> None:
+        for phrase in (
+            "We know exactly how you feel.",
+            "We also have been in your shoes.",
+            "Kami tahu apa yang Anda rasakan.",
+            "Kami juga pernah berada di posisi Anda.",
+        ):
+            spec = load_json("content-spec.example.json")
+            spec["state"] = "BRAND_QA"
+            spec["single_message"] = phrase
+            spec["human_copy_brief"] = {"proof": {"source_refs": ["arbitrary-ref"]}}
+            spec["copy_quality_audit"] = {"status": "pass", "reason_codes": [], "findings": []}
+            report = validate_content_spec(spec, approved_brand(), self.TODAY)
+            self.assertIn("UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM", {issue.code for issue in report.errors}, phrase)
+
+    def test_ordinary_institutional_first_person_is_not_false_positive_intimacy(self) -> None:
+        spec = load_json("content-spec.example.json")
+        spec["state"] = "BRAND_QA"
+        spec["single_message"] = "Kami menyediakan panduan yang jelas untuk langkah berikutnya."
+        spec["human_copy_brief"] = {"proof": {"source_refs": ["arbitrary-ref"]}}
+        spec["copy_quality_audit"] = {"status": "pass", "reason_codes": [], "findings": []}
+        report = validate_content_spec(spec, approved_brand(), self.TODAY)
+        self.assertNotIn("UNSUPPORTED_PERSONAL_OR_PERFORMANCE_CLAIM", {issue.code for issue in report.errors})
 
     def test_malformed_route_and_proof_ids_fail_structurally_without_crashing(self) -> None:
         for malformed_route_id in ({}, [], None):
@@ -642,10 +733,16 @@ class ValidatorTests(unittest.TestCase):
 
     def test_policy_revision_must_be_bound_to_privileged_approval(self) -> None:
         spec = make_approved_spec()
-        context = trusted_policy(spec)
         context = trusted_policy(spec, revision_override="2026-08-19T000001Z-r2")
         report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
         self.assertIn("trusted_policy_revision", {issue.code for issue in report.errors})
+
+    def test_trusted_policy_requires_policy_id_and_revision_metadata(self) -> None:
+        spec = make_approved_spec()
+        for field in ("policy_id", "revision"):
+            context = trusted_policy(spec, omit_fields=(field,))
+            report = validate_content_spec(spec, approved_brand(), self.TODAY, context, actor_id="lead-fixture")
+            self.assertIn("trusted_policy_metadata", {issue.code for issue in report.errors})
 
     def test_embedded_verified_claim_requires_external_brand_bundle(self) -> None:
         spec = make_approved_spec()
@@ -739,6 +836,144 @@ class ValidatorTests(unittest.TestCase):
             brand_actor_id="lead-fixture",
         )
         self.assertIn("brand_bundle_invalid", {issue.code for issue in report.errors})
+
+    def test_privileged_product_overlay_binds_to_runtime_master_revision(self) -> None:
+        spec = make_approved_spec()
+        master_bundle = neutral_brand_bundle()
+        report = validate_content_spec(
+            spec,
+            approved_brand(),
+            self.TODAY,
+            trusted_policy(spec),
+            actor_id="lead-fixture",
+            brand_bundle=neutral_brand_bundle(
+                product_id="sample-product",
+                parent_brand_revision=MASTER_BRAND_REVISION,
+            ),
+            brand_policy_context=trusted_brand_policy(spec, product_id="sample-product"),
+            brand_actor_id="brand-lead-fixture",
+            master_brand_bundle=master_bundle,
+        )
+        self.assertEqual([], report.issues)
+
+    def test_privileged_product_overlay_rejects_forged_runtime_parent_binding(self) -> None:
+        spec = make_approved_spec()
+        master_bundle = neutral_brand_bundle()
+        report = validate_content_spec(
+            spec,
+            approved_brand(),
+            self.TODAY,
+            trusted_policy(spec),
+            actor_id="lead-fixture",
+            brand_bundle=neutral_brand_bundle(
+                product_id="sample-product",
+                parent_brand_revision="2026-08-18T000000Z-r1",
+            ),
+            brand_policy_context=trusted_brand_policy(spec, product_id="sample-product"),
+            brand_actor_id="brand-lead-fixture",
+            master_brand_bundle=master_bundle,
+        )
+        self.assertIn("brand_master_revision_mismatch", {issue.code for issue in report.errors})
+
+    def test_privileged_product_overlay_requires_master_bundle_binding(self) -> None:
+        spec = make_approved_spec()
+        report = validate_content_spec(
+            spec,
+            approved_brand(),
+            self.TODAY,
+            trusted_policy(spec),
+            actor_id="lead-fixture",
+            brand_bundle=neutral_brand_bundle(
+                product_id="sample-product",
+                parent_brand_revision=MASTER_BRAND_REVISION,
+            ),
+            brand_policy_context=trusted_brand_policy(spec, product_id="sample-product"),
+            brand_actor_id="brand-lead-fixture",
+        )
+        self.assertIn("brand_master_bundle_required", {issue.code for issue in report.errors})
+
+    def test_privileged_product_overlay_rejects_master_bundle_scope_or_product(self) -> None:
+        for field, value, expected_code in (
+            ("tenant_id", "other-tenant", "master_brand_bundle_scope"),
+            ("product_id", "other-product", "master_brand_bundle_product"),
+        ):
+            spec = make_approved_spec()
+            master_bundle = Path(neutral_brand_bundle())
+            profile_path = master_bundle / "brand-profile.json"
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            if field == "tenant_id":
+                profile["scope"][field] = value
+            else:
+                profile["scope"][field] = value
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+            report = validate_content_spec(
+                spec,
+                approved_brand(),
+                self.TODAY,
+                trusted_policy(spec),
+                actor_id="lead-fixture",
+                brand_bundle=neutral_brand_bundle(
+                    product_id="sample-product",
+                    parent_brand_revision=MASTER_BRAND_REVISION,
+                ),
+                brand_policy_context=trusted_brand_policy(spec, product_id="sample-product"),
+                brand_actor_id="brand-lead-fixture",
+                master_brand_bundle=master_bundle,
+            )
+            self.assertIn(expected_code, {issue.code for issue in report.errors})
+
+    def test_cli_loads_separate_brand_policy(self) -> None:
+        spec = make_approved_spec()
+        spec_path = write_input_json("cli-spec.json", spec)
+        brand_path = write_input_json("cli-brand.json", approved_brand())
+        policy_context = trusted_policy(spec)
+        policy_path = write_input_json("cli-policy.json", dict(policy_context.data))
+        brand_policy_path = write_input_json(
+            "cli-brand-policy.json",
+            {
+                "schema_version": "1.0",
+                "policy_id": "sample-brand-policy",
+                "revision": spec["policy"]["revision"],
+                "source": "local_authenticated_policy",
+                "scope": {
+                    "tenant_id": spec["scope"]["tenant_id"],
+                    "client_id": spec["scope"]["client_id"],
+                    "brand_id": spec["brand_id"],
+                    "product_id": None,
+                },
+                "role_mapping": {
+                    "admin": ["brand-admin-fixture"],
+                    "lead": ["brand-lead-fixture"],
+                    "reviewer": [],
+                    "member": [],
+                    "publisher": [],
+                },
+            },
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    str(spec_path),
+                    "--brand",
+                    str(brand_path),
+                    "--policy",
+                    str(policy_path),
+                    "--actor-id",
+                    "lead-fixture",
+                    "--brand-bundle",
+                    neutral_brand_bundle(),
+                    "--brand-policy",
+                    str(brand_policy_path),
+                    "--brand-actor-id",
+                    "brand-lead-fixture",
+                    "--master-brand-bundle",
+                    neutral_brand_bundle(),
+                    "--json",
+                ]
+            )
+        self.assertEqual(0, result)
+        self.assertTrue(json.loads(output.getvalue())["valid"])
 
     def test_brand_bundle_policy_scope_and_activation_actor_are_exact(self) -> None:
         spec = make_approved_spec()

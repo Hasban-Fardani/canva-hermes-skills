@@ -23,11 +23,11 @@ actor.
 
 Use `social-content-studio` with a validated scope and approved copy bundle.
 Keep tenant, client, product, brand, account, and content identifiers isolated.
-The normal path is source packet → brief with audience tension and proof →
-three to five genuinely different route cards → human route selection → art
-direction → Canva draft → deterministic QA → human approval → export or manual
-handoff. Prompt-only generation is exploratory; it must not be the source of
-truth for final copy, logo, icon, layout, or CTA.
+The copy-first path is observation/source packet → Human Copy Brief → three
+distinct message premises → human selection → copy-quality audit →
+copy-to-layout contract → Canva draft → deterministic QA → human approval →
+export or manual handoff. Prompt-only generation is exploratory; it must not be
+the source of truth for final copy, logo, icon, layout, or CTA.
 
 Before any Canva mutation, reject or resolve an underspecified brief and record
 why the selected route differs from recent scoped work. Use an approved Canva
@@ -44,6 +44,18 @@ digests, route and layout fingerprints, provenance, and measurement observations
 belong in encrypted, retained, tenant/client/product/brand-scoped runtime only.
 Keep quality, production, audience, business, and risk metrics as separate
 measurement layers; do not optimize a single aesthetic or AI-detector score.
+
+Optional tools may provide mechanical lint, structural evals, regression
+comparisons, tracing, or provenance. They are advisory evidence only: no tool
+provides human taste or an authorship score, and this repository ships no
+external linter dependency or auto-humanizer.
+
+Workflow-created Canva designs belong under an explicit
+`tenant/client/product/brand/account` hierarchy with separate approved-template,
+working, review, and approved-export areas. Resolve the exact authorized folder
+by scope; create it idempotently only when absent, verify its returned ID, and
+then create the design. Never reorganize unrelated existing Canva assets. Keep
+folder, design, and template IDs in the scoped runtime registry only.
 
 The default policy is attended approval. If a bounded unattended policy is
 explicitly enabled, validate its scope, role, preapproved template/version, and

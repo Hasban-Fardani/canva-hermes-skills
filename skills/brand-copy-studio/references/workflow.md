@@ -22,6 +22,10 @@ for authorization, approval, and any ambiguous interpretation.
    before activation: audience situations, strategic tension, human proof,
    positive/negative voice examples, distinctive assets and visual rules,
    model-use policy, approval roles, and scoped feedback reason codes.
+7. Complete the Human Copy Brief before drafting: audience moment and
+   observable behavior, brand stance/right-to-speak, deliberate refusals,
+   concrete proof details, voice-as-behavior, approved verbal assets, locale
+   and code-switching rules, and fake-intimacy/unsupported-first-person limits.
 
 ## External observation
 

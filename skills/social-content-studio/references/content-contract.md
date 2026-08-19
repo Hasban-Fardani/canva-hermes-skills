@@ -217,6 +217,13 @@ synthesized as Brand authority. The validator matches the active master/overlay,
 exact approved claim wording/expiry, and approved provider-neutral copy
 recipe/version. Profile-only inputs can remain attended drafts or human-
 reviewed work; they cannot self-attest privileged claim or unattended evidence.
+For a privileged product overlay, also pass the independently trusted master
+master bundle with `--master-brand-bundle`. The validator reads and validates
+the active, product-neutral master profile and requires an exact match to the
+overlay's `parent_brand_revision`; a missing, malformed, wrong-scope, or
+mismatched master bundle fails closed. A raw revision flag cannot authorize
+an overlay. Master bundles and non-privileged draft use do not require this
+runtime binding.
 
 ## Approved template registry
 

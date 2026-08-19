@@ -14,6 +14,10 @@ layout fingerprints, rejection reasons, approval evidence, and performance
 observations are runtime data and must remain scoped to the active
 tenant/client/product/brand/account.
 
+Canva folder, design, and template IDs are opaque runtime identifiers. Resolve
+or create only the explicitly authorized scope, never reorganize unrelated
+assets, and keep the resulting registry outside this repository.
+
 Before publishing a change:
 
 1. Run all three skill test suites.

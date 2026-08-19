@@ -19,32 +19,68 @@ icon, layout, dan CTA tetap harus editable dan terstruktur.
 
 ```mermaid
 flowchart LR
-  A[Scoped source packet] --> B[Brief with tension<br/>+ content contract]
-  B --> C[3–5 genuinely different<br/>route cards]
-  C --> D{Human selects route}
-  D --> E[Art direction<br/>+ one distinctive move]
-  E --> F[Approved Canva template<br/>folder + controls]
-  F --> G[Editable production<br/>and render]
-  G --> H[Deterministic QA<br/>OCR · layout · semantic · WCAG · rights]
-  H --> I{Human approval}
-  I -- Revise --> E
-  I -- Approve --> J[Export + download<br/>checksum + receipt]
-  J --> K{Publish?}
-  K -- No --> L[Handoff complete]
-  K -- Yes --> M[Separate authorized<br/>publishing action]
-  M --> N[Scoped runtime feedback,<br/>fingerprints, and measurement]
+  A[Observation / source packet] --> B[Human Copy Brief]
+  B --> C[3 distinct message premises]
+  C --> D{Human selects premise}
+  D --> E[Copy-quality audit]
+  E --> F[Copy-to-layout contract]
+  F --> G[Approved Canva template<br/>folder + controls]
+  G --> H[Editable production<br/>and render]
+  H --> I[Deterministic QA<br/>OCR · layout · semantic · WCAG · rights]
+  I --> J{Human approval}
+  J -- Revise --> E
+  J -- Approve --> K[Export + download<br/>checksum + receipt]
+  K --> L{Publish?}
+  L -- No --> M[Handoff complete]
+  L -- Yes --> N[Separate authorized<br/>publishing action]
+  N --> O[Scoped runtime feedback,<br/>fingerprints, and measurement]
 ```
 
-The route set must differ in strategic idea, narrative order, visual premise, or
-asset plan; changing only a color, font, or synonym is not divergence. Run
-copy/claim and anti-pattern review before Canva, inspect every rendered page
-with deterministic checks, and keep visual critique and final approval human-led.
-Store rejection reasons, provenance, approval records, checksums, and recent
-content fingerprints only in tenant/client/product/brand-scoped runtime data.
+The Human Copy Brief records the audience situation, tension, point of view,
+proof, claim boundaries, message jobs, and requested behavior. Premises must
+differ in the idea or point of view, not merely in color, font, layout, or
+synonym. The selected premise passes a copy-quality audit before it becomes a
+copy-to-layout contract; Canva is production and collaboration, not the place
+where an underspecified message is invented.
+
+Existing tools may assist with mechanical style lint, structural evaluations,
+regression comparisons, tracing, and provenance. They flag patterns and record
+evidence; they do not supply taste, a human-quality score, or an authorship
+detector. No external linter dependency ships with this repository, and no
+automatic rewrite is a substitute for human copy judgment.
+
+Inspect every rendered page with deterministic checks, and keep visual critique
+and final approval human-led. Store rejection reasons, provenance, approval
+records, checksums, and recent content fingerprints only in
+tenant/client/product/brand-scoped runtime data.
 
 Measure separate layers: human quality, production efficiency, audience
 response, business outcomes, and risk. A slop index or detector score is
 diagnostic telemetry, never an authorship label or a substitute for review.
+
+### Canva foldering policy
+
+Workflow-created designs use an explicit, scope-bound hierarchy:
+
+```text
+tenant/
+└── client/
+    └── product/
+        └── brand/
+            └── account/
+                ├── approved-templates/
+                ├── working/
+                ├── review/
+                └── approved-exports/
+```
+
+At runtime, resolve the exact tenant/client/product/brand/account scope first.
+Resolve an existing authorized folder by its scoped identity; if it is absent,
+create only that folder idempotently, then verify the returned folder ID before
+creating a design. If scope or ownership is ambiguous, stop. Never reorganize,
+rename, move, or clean up unrelated existing Canva assets. A runtime design
+registry may retain opaque folder/design/template IDs and revisions, but those
+records never enter this repository.
 
 Repositori ini adalah lapisan instruksi dan validasi; data runtime tetap berada
 di luar repositori. Persetujuan berjalan approval-first secara default, sedangkan

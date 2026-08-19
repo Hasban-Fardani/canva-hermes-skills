@@ -151,6 +151,28 @@ class BrandBundleValidatorTests(unittest.TestCase):
             "rights": {"status": "exact"},
             "gaps": [],
         }
+        for field, key, value in (
+            ("situation_patterns", "situation", "A concrete audience situation"),
+            ("audience_moments", "moment", "A real moment in the audience journey"),
+            ("observable_behaviors", "behavior", "A behavior that can be observed"),
+            ("concrete_proof_details", "detail", "A supplied detail that grounds the message"),
+            ("approved_verbal_assets", "asset", "A supplied verbal asset"),
+            ("owned_vocabulary", "term", "A supplied owned term"),
+        ):
+            profile[field] = [{"id": f"{field.replace('_', '-')}-1", key: value, "evidence_status": "exact", "source_ids": ["source-1"]}]
+        for field, key, value in (
+            ("brand_stance", "stance", "Take a clear, useful position"),
+            ("right_to_speak", "right", "Speak from supplied evidence"),
+            ("what_we_refuse_to_say", "refusal", "Do not imply unsupported outcomes"),
+            ("voice_as_behavior", "behavior", "Use concrete verbs and name the object"),
+        ):
+            profile[field] = {"id": f"{field.replace('_', '-')}-1", key: value, "evidence_status": "exact", "source_ids": ["source-1"]}
+        for field, rule in (
+            ("locale_policy", "Use Indonesian as the default; code-switch only with audience evidence"),
+            ("fake_intimacy_policy", "Do not present invented diary or lived experience as brand experience"),
+            ("unsupported_first_person_policy", "First-person claims require named provenance and approval"),
+        ):
+            profile[field] = {"rule": rule, "evidence_status": "exact", "source_ids": ["source-1"]}
         return {
             "brand-profile.json": profile,
             "claim-registry.json": {**envelope, "claims": []},
@@ -262,7 +284,7 @@ class BrandBundleValidatorTests(unittest.TestCase):
         self.docs["brand-profile.json"]["rights"]["status"] = "unverified"
         self.docs["brand-profile.json"]["voice"][0]["evidence_status"] = "observed"
         profile = self.docs["brand-profile.json"]
-        for field in ("audience_situations", "human_proof_points", "distinctive_assets", "visual_principles", "composition_rules", "avoid_patterns"):
+        for field in ("audience_situations", "human_proof_points", "distinctive_assets", "visual_principles", "composition_rules", "avoid_patterns", "situation_patterns", "audience_moments", "observable_behaviors", "concrete_proof_details", "approved_verbal_assets", "owned_vocabulary"):
             for record in profile[field]:
                 record["evidence_status"] = "observed"
                 if field == "distinctive_assets":
@@ -271,6 +293,8 @@ class BrandBundleValidatorTests(unittest.TestCase):
         for polarity in ("positive", "negative"):
             for record in profile["voice_examples"][polarity]:
                 record["evidence_status"] = "observed"
+        for field in ("brand_stance", "right_to_speak", "what_we_refuse_to_say", "voice_as_behavior", "locale_policy", "fake_intimacy_policy", "unsupported_first_person_policy"):
+            profile[field]["evidence_status"] = "observed"
         self._write_docs()
         self.assertEqual(validate_brand_bundle(self.root), [])
 
@@ -283,6 +307,46 @@ class BrandBundleValidatorTests(unittest.TestCase):
         errors = validate_brand_bundle(self.root)
         self.assertTrue(any("observe operation may only create a draft bundle" in error for error in errors))
         self.assertTrue(any("observe operation requires observed" in error for error in errors))
+
+    def test_observe_rejects_exact_human_copy_brief_fields(self) -> None:
+        self._make_scoped()
+        self.docs["provenance.json"]["update"]["operation"] = "observe"
+        self.docs["brand-profile.json"]["rights"]["status"] = "unverified"
+        self.docs["brand-profile.json"]["right_to_speak"]["evidence_status"] = "exact"
+        self._write_docs()
+        errors = validate_brand_bundle(self.root)
+        self.assertTrue(any("brand-profile.json.right_to_speak: observe operation requires observed" in error for error in errors))
+
+    def test_observe_rejects_exact_or_approved_each_human_copy_scalar(self) -> None:
+        fields = (
+            "brand_stance",
+            "right_to_speak",
+            "what_we_refuse_to_say",
+            "voice_as_behavior",
+            "locale_policy",
+            "fake_intimacy_policy",
+            "unsupported_first_person_policy",
+        )
+        for field in fields:
+            with self.subTest(field=field, evidence_status="exact"):
+                self.docs = self._valid_docs()
+                self._make_scoped()
+                self.docs["provenance.json"]["update"]["operation"] = "observe"
+                self.docs["brand-profile.json"]["rights"]["status"] = "unverified"
+                self.docs["brand-profile.json"][field]["evidence_status"] = "exact"
+                self._write_docs()
+                errors = validate_brand_bundle(self.root)
+                self.assertTrue(any(f"brand-profile.json.{field}: observe operation requires" in error for error in errors))
+            with self.subTest(field=field, status="approved"):
+                self.docs = self._valid_docs()
+                self._make_scoped()
+                self.docs["provenance.json"]["update"]["operation"] = "observe"
+                self.docs["brand-profile.json"]["rights"]["status"] = "unverified"
+                self.docs["brand-profile.json"][field]["evidence_status"] = "observed"
+                self.docs["brand-profile.json"][field]["status"] = "approved"
+                self._write_docs()
+                errors = validate_brand_bundle(self.root)
+                self.assertTrue(any(f"brand-profile.json.{field}: observe operation cannot create approved records" in error for error in errors))
 
     def test_observe_rejects_approved_record(self) -> None:
         self._make_scoped()
@@ -807,6 +871,20 @@ class BrandBundleValidatorTests(unittest.TestCase):
             actor_id="admin-1",
         )
         self.assertTrue(any("raw mappings are not accepted" in error for error in errors))
+
+    def test_active_bundle_requires_human_copy_brief_authority_fields(self) -> None:
+        policy = self._make_active_with_authority()
+        del self.docs["brand-profile.json"]["right_to_speak"]
+        self._write_docs()
+        errors = validate_brand_bundle(self.root, policy=policy, actor_id="admin-1")
+        self.assertTrue(any("right_to_speak: required for privileged states" in error for error in errors))
+
+    def test_active_bundle_rejects_malformed_locale_policy(self) -> None:
+        policy = self._make_active_with_authority()
+        self.docs["brand-profile.json"]["locale_policy"] = "English only"
+        self._write_docs()
+        errors = validate_brand_bundle(self.root, policy=policy, actor_id="admin-1")
+        self.assertTrue(any("locale_policy: must be an object" in error for error in errors))
 
 
 if __name__ == "__main__":
