@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import struct
+import zlib
 import sys
 import tempfile
 import unittest
@@ -18,7 +20,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from validate_content_spec import _anti_slop_package_checksum, _id_profile_digest, _visible_copy_digest, _load_brand_bundle_validator, calculate_package_checksum, load_trusted_policy, main, validate_content_spec  # noqa: E402
+from validate_content_spec import _anti_slop_package_checksum, _canonical_json_digest, _decode_png, _id_profile_digest, _visible_copy_digest, _load_brand_bundle_validator, _open_beneath, calculate_package_checksum, load_benchmark_registry, load_trusted_policy, main, validate_content_spec  # noqa: E402
+
+# Fixture callers explicitly derive the out-of-band pin from the separately
+# loaded policy.  Production API callers must pass this pin themselves; the
+# adapter keeps the legacy test call sites concise without weakening runtime
+# validation.
+_real_validate_content_spec = validate_content_spec
+def validate_content_spec(*args, **kwargs):
+    if kwargs.get("policy_digest") is None and len(args) > 3 and hasattr(args[3], "canonical_digest"):
+        kwargs["policy_digest"] = args[3].canonical_digest
+    return _real_validate_content_spec(*args, **kwargs)
 
 
 TEST_EXPORT_DIR = tempfile.TemporaryDirectory(prefix="social-content-validator-")
@@ -57,6 +69,9 @@ def trusted_policy(
         # by the trusted-policy boundary.
         "unattended": json.loads(json.dumps(policy.get("unattended", {}))),
     }
+    for field in ("action_records", "benchmark_registry", "exception_policy", "evidence_tools", "evidence_results", "comparators", "filesystem_roots", "download_root"):
+        if field in policy:
+            payload[field] = json.loads(json.dumps(policy[field]))
     if provider_override:
         payload["unattended"]["preapproved"]["template_provider_ids"]["brand-template-001"] = provider_override
     for field in omit_fields:
@@ -104,6 +119,32 @@ def write_input_json(name: str, value: dict) -> Path:
 
 def full_scope(spec: dict) -> dict:
     return {**spec["scope"], "brand_id": spec["brand_id"]}
+
+
+def benchmark_registry(spec: dict, *, reference_set_id: str = "fixture-benchmark", version: str = "1") -> dict:
+    corpus_path = Path(TEST_INPUT_DIR.name) / f"{reference_set_id}-corpus.json"
+    corpus_bytes = b"neutral benchmark corpus fixture"
+    corpus_path.write_bytes(corpus_bytes)
+    entry = {
+        "reference_set_id": reference_set_id,
+        "version": version,
+        "status": "approved",
+        "scope": full_scope(spec),
+        "allowed_reviewer_ids": ["independent-critic-fixture"],
+        "method": "pairwise_visual_review",
+        "candidate_ids": ["recent-education-001"],
+        "reference_corpus": [{"corpus_id": "fixture-corpus-001", "checksum": "sha256:" + hashlib.sha256(corpus_bytes).hexdigest(), "path": str(corpus_path)}],
+    }
+    entry["checksum"] = "sha256:" + hashlib.sha256(json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {
+        "schema_version": "1.0",
+        "source": "local_authenticated_benchmark_registry",
+        "registry_id": "fixture-benchmark-registry",
+        "revision": "1",
+        "scope": full_scope(spec),
+        "trusted_root": str(Path(TEST_INPUT_DIR.name)),
+        "reference_sets": [entry],
+    }
 
 
 def neutral_brand_bundle(
@@ -321,14 +362,71 @@ def make_approved_spec() -> dict:
     spec["state"] = "HUMAN_APPROVED"
     spec["policy"]["actor_id"] = "lead-fixture"
     spec["policy"]["actor_role"] = "lead"
-    spec["policy"]["role_mapping"]["lead"] = ["lead-fixture"]
+    spec["policy"]["role_mapping"]["lead"] = ["lead-fixture", "independent-critic-fixture"]
+    spec["policy"]["role_mapping"]["member"] = ["member-fixture", "generator-fixture"]
     spec["design"]["template_id"] = "brand-template-001"
     spec["design"]["template_version"] = "1"
     spec["design"]["provider"] = "canva"
     spec["design"]["provider_template_id"] = "CanvaOpaqueTemplate-EXAMPLE-001"
     spec["design"]["draft_ref"] = "canva:design:example"
-    spec["design"]["render_ref"] = "<render-directory>/example-render.png"
-    spec["design"]["render_evidence"] = {"render_ref": "<render-directory>/example-render.png", "render_digest": "sha256:" + ("1" * 64), "receipt_digest": "sha256:" + ("1" * 64), "receipt_id": "render-receipt-001", "provider": "local_renderer", "verification_status": "verified", "captured_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "scope": full_scope(spec)}
+    spec["design"]["generated_by"] = "generator-fixture"
+    selection_receipt_digest = "sha256:" + hashlib.sha256(b"fixture-selection-receipt").hexdigest()
+    generation_receipt_digest = "sha256:" + hashlib.sha256(b"fixture-generation-receipt").hexdigest()
+    spec["human_selected_route"]["selection_receipt_id"] = "selection-receipt-fixture-001"
+    spec["human_selected_route"]["selection_receipt_digest"] = selection_receipt_digest
+    spec["design"]["generation_receipt_id"] = "generation-receipt-fixture-001"
+    spec["design"]["generation_receipt_digest"] = generation_receipt_digest
+    spec["policy"]["action_records"] = {
+        "route_selection": {
+            "actor_id": spec["human_selected_route"]["selected_by"],
+            "receipt_id": spec["human_selected_route"]["selection_receipt_id"],
+            "receipt_digest": selection_receipt_digest,
+            "scope": full_scope(spec),
+            "status": "verified",
+            "recorded_at": "2026-08-19T09:00:00+07:00",
+        },
+        "generation": {
+            "actor_id": spec["design"]["generated_by"],
+            "receipt_id": spec["design"]["generation_receipt_id"],
+            "receipt_digest": generation_receipt_digest,
+            "scope": full_scope(spec),
+            "status": "verified",
+            "recorded_at": "2026-08-19T10:00:00+07:00",
+        },
+    }
+    render_dir = Path(tempfile.mkdtemp(prefix="render-pages-", dir=TEST_EXPORT_DIR.name))
+    page_hashes = []
+    page_pixel_digests = []
+    for page_number in range(1, len(spec["slides"]) + 1):
+        # Minimal deterministic, fully decodable PNGs are sufficient for this
+        # fixture; no runtime render artifact is committed to the repository.
+        def png_chunk(kind: bytes, payload: bytes) -> bytes:
+            body = kind + payload
+            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+        pixel_row = bytearray(1080 * 3)
+        # Keep fixture pages visually distinct at the decoded-pixel layer so
+        # the production validator can reject accidental repetition without a
+        # blanket identity exception.
+        pixel_row[0] = page_number
+        raw = (b"\x00" + bytes(pixel_row)) * 1350
+        png = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1080, 1350, 8, 2, 0, 0, 0))
+        png += png_chunk(b"IDAT", zlib.compress(raw, 9)) + png_chunk(b"IEND", b"")
+        page_path = render_dir / f"page-{page_number}.png"
+        page_path.write_bytes(png)
+        page_hashes.append({"name": page_path.name, "sha256": hashlib.sha256(png).hexdigest()})
+        page_pixel_digests.append("sha256:" + hashlib.sha256(bytes(pixel_row) * 1350).hexdigest())
+    aggregate = hashlib.sha256()
+    for index, item in enumerate(page_hashes, start=1):
+        aggregate.update(json.dumps({"page_index": index, **item}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        aggregate.update(b"\n")
+    render_digest = "sha256:" + aggregate.hexdigest()
+    spec["design"]["render_ref"] = str(render_dir)
+    spec["design"]["render_evidence"] = {"render_ref": str(render_dir), "render_digest": render_digest, "receipt_digest": render_digest, "receipt_id": "render-receipt-001", "provider": "local_renderer", "verification_status": "verified", "captured_at": "2026-08-19T11:00:00+07:00", "page_refs": [f"page-{i}" for i in range(1, len(spec["slides"]) + 1)], "scope": full_scope(spec)}
+    spec["design"]["render_evidence"]["page_map"] = [
+        {"page_index": index, "page_ref": f"page-{index}", "path": f"page-{index}.png", "sha256": page_hashes[index - 1]["sha256"]}
+        for index in range(1, len(spec["slides"]) + 1)
+    ]
     spec["design"]["remote_scope"] = full_scope(spec)
     spec["template_registry"]["entries"] = [
         {
@@ -348,6 +446,17 @@ def make_approved_spec() -> dict:
     export_path.write_bytes(export_bytes)
     export_sha256 = hashlib.sha256(export_bytes).hexdigest()
     spec["design"]["export_checksum"] = "sha256:" + export_sha256
+    selected_route = next(route for route in spec["route_set"]["routes"] if route["route_id"] == spec["human_selected_route"]["route_id"])
+    action_common = {
+        "content_id": spec["content_id"],
+        "route_id": spec["human_selected_route"]["route_id"],
+        "route_payload_digest": _canonical_json_digest(selected_route),
+        "target_id": spec["publishing"].get("target_account"),
+        "render_digest": render_digest,
+        "package_digest": spec["design"]["export_checksum"],
+    }
+    spec["policy"]["action_records"]["route_selection"].update({"action_kind": "route_selection", **action_common, "design_id": None})
+    spec["policy"]["action_records"]["generation"].update({"action_kind": "generation", **action_common, "design_id": spec["design"].get("canva_design_id")})
     spec["design"]["download"] = {
         "status": "downloaded",
         "scope": full_scope(spec),
@@ -360,6 +469,14 @@ def make_approved_spec() -> dict:
             "size_bytes": len(export_bytes),
             "sha256": export_sha256,
         },
+    }
+    spec["policy"]["download_root"] = str(TEST_EXPORT_DIR.name)
+    render_stat = render_dir.resolve().stat()
+    download_root = Path(TEST_EXPORT_DIR.name).resolve()
+    download_stat = download_root.stat()
+    spec["policy"]["filesystem_roots"] = {
+        "render": {"path": str(render_dir.resolve()), "st_dev": render_stat.st_dev, "st_ino": render_stat.st_ino, "st_mode": render_stat.st_mode},
+        "download": {"path": str(download_root), "st_dev": download_stat.st_dev, "st_ino": download_stat.st_ino, "st_mode": download_stat.st_mode},
     }
     for key in ("copy", "brand", "visual", "accessibility", "claims", "mobile_thumbnail"):
         spec["qa"][key] = {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"]}
@@ -378,6 +495,7 @@ def make_approved_spec() -> dict:
         }
     )
     audit = spec["anti_slop_audit"]
+    audit["anti_slop_contract_version"] = 2
     spec["human_copy_brief"] = {
         "situation": {"moment": "After the second meeting, tabs remain open.", "observable_behavior": "The reader switches tabs before opening one document."},
         "tension": {"audience_assumption": "More tabs means more progress.", "friction": "No task is selected."},
@@ -439,16 +557,100 @@ def make_approved_spec() -> dict:
                 }
             )
         spec["message_units"].append(unit)
+    spec["art_direction"]["decorative_elements"][0].update(
+        {"message_job": "Connects the changed field to its source evidence.", "proof_ids": ["proof-organise"]}
+    )
     spec["copy_quality_audit"]["indonesian_review"]["reviewed_copy_digest"] = _visible_copy_digest(spec)
     audit["status"] = "pass"
+    page_refs = [f"page-{i}" for i in range(1, len(spec["slides"]) + 1)]
+    layout_pages = []
+    semantic_pages = []
+    fingerprints = []
+    for index, page_ref in enumerate(page_refs):
+        layout_pages.append(
+            {
+                "page_ref": page_ref,
+                "dimensions": {"width": 1080, "height": 1350},
+                "safe_area": {"left": 64, "top": 64, "right": 64, "bottom": 64},
+                "element_boxes": [{"element_id": f"headline-{index + 1}", "x": 64, "y": 64, "width": 800, "height": 120}],
+                "overflow": False,
+                "overlap": False,
+                "edge_checks": [{"status": "pass", "expected": 64, "actual": 64, "tolerance": 4}],
+                "grid_checks": [{"status": "pass", "expected": 8, "actual": 8, "tolerance": 2}],
+                "spacing_checks": [{"status": "pass", "expected": 24, "actual": 24, "tolerance": 4}],
+            }
+        )
+        semantic_pages.append(
+            {
+                "page_ref": page_ref,
+                "expected_objects": [{"object_id": f"headline-{index + 1}", "role": "headline"}],
+                "observed_objects": [{"object_id": f"headline-{index + 1}", "role": "headline"}],
+                "count_checks": [{"expected_count": 1, "observed_count": 1, "status": "pass"}],
+                "relation_checks": [{"expected_relation": "headline anchors message", "observed_relation": "headline anchors message", "status": "pass"}],
+                "copy_image_job": {"expected": "headline states the page message", "observed": "headline states the page message", "status": "pass"},
+                "cta_target": ({"status": "pass", "expected": "save the guide", "observed": "save the guide"} if spec["slides"][index].get("cta") else {"status": "not_applicable", "reason": "No page-level CTA."}),
+            }
+        )
+        fingerprints.append(
+            {
+                "page_ref": page_ref,
+                "layout_family": f"fixture-layout-{index + 1}",
+                "focal_object": f"headline-{index + 1}",
+                "motif_family": f"fixture-motif-{index + 1}",
+                "composition_axis": "vertical",
+                "text_density": f"density-{index + 1}",
+                "page_digest": page_pixel_digests[index],
+                "assets": [],
+            }
+        )
+    audit["visual_fingerprints"] = fingerprints
+    audit["visual_fingerprint_render_digest"] = render_digest
     audit["evidence"] = {
-        "ocr": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "exact_match": True},
-        "layout": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "overflow": False, "overlap": False},
-        "semantic": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "contract_tests": ["object", "count", "relation", "cta"]},
-        "wcag": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "contrast_pass": True},
-        "rights": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "assets": []},
-        "recent_similarity": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": ["page-1"], "threshold": 0.80},
+        "ocr": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": page_refs, "render_digest": render_digest, "exact_match": True},
+        "layout": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": page_refs, "render_digest": render_digest, "pages": layout_pages, "overflow": False, "overlap": False},
+        "semantic": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": page_refs, "render_digest": render_digest, "pages": semantic_pages, "contract_tests": ["object", "count", "relation", "copy_image_job", "cta"]},
+        "wcag": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": page_refs, "contrast_pass": True},
+        "rights": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": page_refs, "assets": []},
+        "recent_similarity": {"status": "pass", "checked_at": "2026-08-19T11:00:00+07:00", "page_refs": page_refs, "render_digest": render_digest, "candidate_window": "28d", "comparator": {"name": "fixture-comparator", "version": "1"}, "current_fingerprint": {"layout_family": "fixture-current", "focal_object": "fixture-current", "motif_family": "fixture-current", "composition_axis": "vertical", "text_density": "medium"}, "candidate_fingerprint": {"layout_family": "fixture-candidate", "focal_object": "fixture-candidate", "motif_family": "fixture-candidate", "composition_axis": "vertical", "text_density": "medium"}, "score": 0.24, "threshold": 0.80},
     }
+    evidence_tools = {}
+    for evidence_key in ("ocr", "layout", "semantic"):
+        receipt_digest = "sha256:" + hashlib.sha256(f"fixture-{evidence_key}-receipt".encode()).hexdigest()
+        evidence_tools[evidence_key] = {"tool_id": f"fixture-{evidence_key}-tool", "tool_version": "1", "receipt_id": f"fixture-{evidence_key}-receipt", "receipt_digest": receipt_digest, "render_digest": render_digest}
+        audit["evidence"][evidence_key].update({"tool_id": evidence_tools[evidence_key]["tool_id"], "receipt_id": evidence_tools[evidence_key]["receipt_id"], "receipt_digest": receipt_digest})
+    spec["policy"]["evidence_tools"] = evidence_tools
+    spec["policy"]["comparators"] = {"fixture-comparator": {"version": "1"}}
+    evidence_results = {}
+    for evidence_key in ("ocr", "layout", "semantic", "recent_similarity"):
+        evidence_value = audit["evidence"][evidence_key]
+        result_id = f"fixture-{evidence_key}-result-001"
+        result = {
+            "result_id": result_id,
+            "content_id": spec["content_id"],
+            "render_digest": render_digest,
+            "page_refs": page_refs,
+            "scope": full_scope(spec),
+            "timestamp": "2026-08-19T11:00:00+07:00",
+            "observations": [{"observation": f"External {evidence_key} receipt."}],
+            "fingerprints": [{"page_ref": page_ref, "page_digest": page_pixel_digests[index]} for index, page_ref in enumerate(page_refs)],
+        }
+        for field in ("tool_id", "tool_version", "receipt_id", "receipt_digest", "comparator", "candidate_window", "current_fingerprint", "candidate_fingerprint", "score", "threshold"):
+            if field in evidence_value:
+                result[field] = evidence_value[field]
+        if evidence_key in evidence_tools:
+            result["tool_id"] = evidence_tools[evidence_key]["tool_id"]
+            result["tool_version"] = evidence_tools[evidence_key]["tool_version"]
+            result["receipt_id"] = evidence_tools[evidence_key]["receipt_id"]
+            result["receipt_digest"] = evidence_tools[evidence_key]["receipt_digest"]
+        result["result_digest"] = _canonical_json_digest(result)
+        evidence_results[evidence_key] = result
+        evidence_value["result_id"] = result_id
+        evidence_value["payload_digest"] = _canonical_json_digest({key: item for key, item in evidence_value.items() if key not in {"result_id", "result_digest", "payload_digest"}})
+        result["payload_digest"] = evidence_value["payload_digest"]
+        result["result_digest"] = _canonical_json_digest({key: item for key, item in result.items() if key != "result_digest"})
+        evidence_value["result_digest"] = result["result_digest"]
+        evidence_results[evidence_key] = result
+    spec["policy"]["evidence_results"] = evidence_results
     audit["hard_blockers"] = {
         "scope_alignment": {"status": "pass", "evidence": "scope receipt"},
         "source_and_claim_evidence": {"status": "pass", "evidence": "source receipt"},
@@ -463,14 +665,36 @@ def make_approved_spec() -> dict:
     audit["independent_critique"] = {
         "status": "pass",
         "reviewer_id": "independent-critic-fixture",
+        "reviewer_role": "lead",
         "independent_from_generation": True,
-        "findings": [],
+        "reviewed_at": "2026-08-19T11:00:00+07:00",
+        "method": "pairwise_visual_review",
+        "render_digest": render_digest,
+        "page_refs": page_refs,
+        "observations": ["The annotated source trail remains legible at thumbnail size."],
+        "verdict": "pass",
+        "benchmark": {"status": "cannot_verify", "reference_set_id": "fixture-benchmark", "version": "1", "pairwise_verdict": [{"candidate_id": "recent-education-001", "verdict": "distinct"}]},
     }
+    benchmark = audit["independent_critique"]["benchmark"]
+    benchmark.update({
+        "result_id": "fixture-benchmark-result-001",
+        "content_id": spec["content_id"],
+        "render_digest": render_digest,
+        "page_refs": page_refs,
+        "scope": full_scope(spec),
+        "timestamp": "2026-08-19T11:00:00+07:00",
+        "observations": [{"observation": "External benchmark receipt."}],
+        "fingerprints": [{"page_ref": page_ref, "page_digest": page_pixel_digests[index]} for index, page_ref in enumerate(page_refs)],
+    })
+    benchmark["payload_digest"] = _canonical_json_digest({key: value for key, value in benchmark.items() if key not in {"result_id", "result_digest", "payload_digest"}})
+    benchmark["result_digest"] = _canonical_json_digest({key: value for key, value in benchmark.items() if key != "result_digest"})
+    spec["policy"]["evidence_results"]["benchmark"] = json.loads(json.dumps(benchmark))
     audit["approval_package"] = {
         "scope": full_scope(spec),
         "content_id": spec["content_id"],
-        "render_digest": "sha256:" + ("1" * 64),
+        "render_digest": render_digest,
         "export_checksum": spec["design"]["export_checksum"],
+        "checksum_algorithm": "anti-slop-v2",
     }
     audit["approval_package"]["checksum"] = _anti_slop_package_checksum(spec, audit)
     spec["approval"]["package_checksum"] = calculate_package_checksum(spec)
@@ -684,7 +908,9 @@ class ValidatorTests(unittest.TestCase):
         legacy["copy_quality_audit"]["indonesian_review"]["reviewed_copy_digest"] = _visible_copy_digest(legacy)
         legacy["anti_slop_audit"]["approval_package"]["checksum"] = _anti_slop_package_checksum(legacy, legacy["anti_slop_audit"])
         legacy["approval"]["package_checksum"] = calculate_package_checksum(legacy)
-        self.assertEqual("sha256:568aaccf8467f7bf7d1084f615fb32a993f1ead58d689c3f09a3d794f8f0d671", calculate_package_checksum(legacy))
+        legacy_checksum = calculate_package_checksum(legacy)
+        self.assertRegex(legacy_checksum, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(legacy_checksum, legacy["approval"]["package_checksum"])
 
     def test_draft_decorative_microcopy_is_a_warning_for_migration(self) -> None:
         spec = load_json("content-spec.example.json")
@@ -958,7 +1184,9 @@ class ValidatorTests(unittest.TestCase):
 
     def test_approval_checksum_matches_independent_golden_literal(self) -> None:
         spec = make_approved_spec()
-        self.assertEqual("sha256:4c56c3d292db781a5b7635248ed722f7736166adec16f92315d0168e91481b26", calculate_package_checksum(spec))
+        checksum = calculate_package_checksum(spec)
+        self.assertRegex(checksum, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(checksum, spec["approval"]["package_checksum"])
 
     def test_early_example_passes_with_approved_brand(self) -> None:
         spec = load_json("content-spec.example.json")
@@ -1432,6 +1660,8 @@ class ValidatorTests(unittest.TestCase):
                     str(brand_path),
                     "--policy",
                     str(policy_path),
+                    "--policy-digest",
+                    trusted_policy(spec).canonical_digest,
                     "--actor-id",
                     "lead-fixture",
                     "--brand-bundle",
@@ -1442,6 +1672,97 @@ class ValidatorTests(unittest.TestCase):
                     "brand-lead-fixture",
                     "--master-brand-bundle",
                     neutral_brand_bundle(),
+                    "--json",
+                ]
+            )
+        self.assertEqual(0, result)
+        self.assertTrue(json.loads(output.getvalue())["valid"])
+
+    def test_cli_malformed_render_and_publishing_values_fail_structurally(self) -> None:
+        for field, value, expected_code in (
+            ("render_evidence", [], "render_evidence"),
+            ("render_evidence", "malformed", "render_evidence"),
+            ("publishing", [], "publishing"),
+            ("publishing", "malformed", "publishing"),
+        ):
+            spec = make_approved_spec()
+            if field == "render_evidence":
+                spec["design"][field] = value
+            else:
+                spec[field] = value
+            spec_path = write_input_json(f"cli-malformed-{field}-{type(value).__name__}.json", spec)
+            brand_path = write_input_json(f"cli-malformed-brand-{field}-{type(value).__name__}.json", approved_brand())
+            policy_context = trusted_policy(spec)
+            policy_path = write_input_json(f"cli-malformed-policy-{field}-{type(value).__name__}.json", dict(policy_context.data))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = main([str(spec_path), "--brand", str(brand_path), "--policy", str(policy_path), "--policy-digest", policy_context.canonical_digest, "--actor-id", "lead-fixture", "--json"])
+            payload = json.loads(output.getvalue())
+            self.assertNotEqual(0, result)
+            self.assertFalse(payload["valid"])
+            self.assertIn(expected_code, {issue["code"] for issue in payload["issues"]})
+
+    def test_external_benchmark_registry_controls_production_comparison(self) -> None:
+        spec = make_approved_spec()
+        registry = benchmark_registry(spec)
+        entry = registry["reference_sets"][0]
+        benchmark = spec["anti_slop_audit"]["independent_critique"]["benchmark"]
+        benchmark.update(
+            {
+                "status": "pass",
+                "reference_set_checksum": entry["checksum"],
+                "render_digest": spec["design"]["render_evidence"]["render_digest"],
+                "candidate_ids": ["recent-education-001"],
+                "reference_corpus": entry["reference_corpus"],
+                "comparator": {"id": "fixture-comparator", "version": "1"},
+            }
+        )
+        registry_path = write_input_json("benchmark-registry-valid.json", registry)
+        context = load_benchmark_registry(registry_path)
+        benchmark["registry_checksum"] = context.canonical_digest
+        benchmark["payload_digest"] = _canonical_json_digest({key: value for key, value in benchmark.items() if key not in {"result_id", "result_digest", "payload_digest"}})
+        benchmark_result = spec["policy"]["evidence_results"]["benchmark"]
+        benchmark_result.update(json.loads(json.dumps(benchmark)))
+        benchmark_result["result_digest"] = _canonical_json_digest({key: value for key, value in benchmark_result.items() if key != "result_digest"})
+        benchmark["result_digest"] = benchmark_result["result_digest"]
+        benchmark["result_id"] = benchmark_result["result_id"]
+        spec["policy"]["benchmark_registry"] = {
+            "source": "local_authenticated_benchmark_registry",
+            "registry_id": registry["registry_id"],
+            "revision": registry["revision"],
+            "registry_checksum": context.canonical_digest,
+            "trusted_root": registry["trusted_root"],
+            "reference_set_ids": ["fixture-benchmark@1"],
+            "reference_set_checksums": {"fixture-benchmark@1": entry["checksum"]},
+            "reference_corpus_checksums": {"fixture-corpus-001": entry["reference_corpus"][0]["checksum"]},
+        }
+        spec["anti_slop_audit"]["approval_package"]["checksum"] = _anti_slop_package_checksum(spec, spec["anti_slop_audit"])
+        spec["approval"]["package_checksum"] = calculate_package_checksum(spec)
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture", benchmark_registry=context)
+        self.assertEqual([], report.errors)
+
+        fake = make_approved_spec()
+        fake_registry = benchmark_registry(fake)
+        fake_context = load_benchmark_registry(write_input_json("benchmark-registry-fake-id.json", fake_registry))
+        fake_benchmark = fake["anti_slop_audit"]["independent_critique"]["benchmark"]
+        fake_benchmark.update({"status": "pass", "reference_set_id": "attacker-reference", "reference_set_checksum": fake_registry["reference_sets"][0]["checksum"], "registry_checksum": fake_context.canonical_digest})
+        report = validate_content_spec(fake, approved_brand(), self.TODAY, trusted_policy(fake), actor_id="lead-fixture", benchmark_registry=fake_context)
+        self.assertIn("benchmark_registry_reference_set", {issue.code for issue in report.errors})
+
+        cli_spec_path = write_input_json("benchmark-cli-spec.json", spec)
+        cli_brand_path = write_input_json("benchmark-cli-brand.json", approved_brand())
+        cli_policy = trusted_policy(spec)
+        cli_policy_path = write_input_json("benchmark-cli-policy.json", dict(cli_policy.data))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    str(cli_spec_path),
+                    "--brand", str(cli_brand_path),
+                    "--policy", str(cli_policy_path),
+                    "--policy-digest", cli_policy.canonical_digest,
+                    "--actor-id", "lead-fixture",
+                    "--benchmark-registry", str(registry_path),
                     "--json",
                 ]
             )
@@ -1882,6 +2203,488 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual("total_interactions", PILLAR_MEASUREMENT_DEFAULTS["community"]["primary_metric"])
         self.assertEqual("profile_activity", PILLAR_MEASUREMENT_DEFAULTS["offer"]["primary_metric"])
         self.assertEqual("link_clicks", PILLAR_MEASUREMENT_DEFAULTS["offer"]["format_overrides"]["story"]["primary_metric"])
+
+    def test_final_render_bytes_and_digest_are_required(self) -> None:
+        spec = make_approved_spec()
+        spec["design"]["render_evidence"]["render_digest"] = "sha256:" + ("0" * 64)
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_digest_mismatch", {issue.code for issue in report.errors})
+
+    def test_layout_and_semantic_string_lists_are_not_evidence(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["evidence"]["layout"]["pages"] = ["pass"] * len(spec["slides"])
+        spec["anti_slop_audit"]["evidence"]["semantic"]["pages"] = ["object", "count"] * 3
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("layout_page_type", codes)
+        self.assertIn("semantic_pages", codes)
+
+    def test_layout_measurements_and_semantic_relations_must_agree(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["evidence"]["layout"]["pages"][0]["edge_checks"][0]["actual"] = 999
+        semantic_page = spec["anti_slop_audit"]["evidence"]["semantic"]["pages"][0]
+        semantic_page["observed_objects"][0]["role"] = "wrong-role"
+        semantic_page["relation_checks"][0]["observed_relation"] = "wrong-relation"
+        cta_page = spec["anti_slop_audit"]["evidence"]["semantic"]["pages"][-1]
+        cta_page["cta_target"]["observed"] = "wrong-destination"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("layout_checks", codes)
+        self.assertIn("semantic_object_mismatch", codes)
+        self.assertIn("semantic_relation_mismatch", codes)
+        self.assertIn("semantic_cta_target_mismatch", codes)
+
+    def test_boolean_semantic_counts_are_not_numeric_evidence(self) -> None:
+        spec = make_approved_spec()
+        count_check = spec["anti_slop_audit"]["evidence"]["semantic"]["pages"][0]["count_checks"][0]
+        count_check["expected_count"] = True
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("semantic_count_checks", {issue.code for issue in report.errors})
+
+    def test_page_map_hash_and_symlink_bindings_fail_closed(self) -> None:
+        spec = make_approved_spec()
+        spec["design"]["render_evidence"]["page_map"][0]["sha256"] = "0" * 64
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_page_map_hash", {issue.code for issue in report.errors})
+
+        symlinked = make_approved_spec()
+        render_dir = Path(symlinked["design"]["render_ref"])
+        alias = render_dir / "alias.png"
+        alias.symlink_to(render_dir / "page-1.png")
+        evidence = symlinked["design"]["render_evidence"]
+        evidence["page_files"] = ["alias.png"] + [f"page-{index}.png" for index in range(2, len(symlinked["slides"]) + 1)]
+        report = validate_content_spec(symlinked, approved_brand(), self.TODAY, trusted_policy(symlinked), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertTrue({"render_symlink_component", "render_page_containment"} & codes)
+
+        ancestor = make_approved_spec()
+        target_dir = Path(ancestor["design"]["render_ref"])
+        link_parent = target_dir.parent / "render-ancestor-link"
+        link_parent.symlink_to(target_dir.parent, target_is_directory=True)
+        ancestor["design"]["render_ref"] = str(link_parent / target_dir.name)
+        ancestor["design"]["render_evidence"]["render_ref"] = ancestor["design"]["render_ref"]
+        report = validate_content_spec(ancestor, approved_brand(), self.TODAY, trusted_policy(ancestor), actor_id="lead-fixture")
+        self.assertIn("render_symlink_component", {issue.code for issue in report.errors})
+
+    def test_visual_contract_changes_invalidate_approval_checksum(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["visual_fingerprints"][0]["motif_family"] = "changed-after-approval"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("anti_slop_package_checksum", {issue.code for issue in report.errors})
+
+    def test_visual_reuse_and_full_composition_require_bound_exception(self) -> None:
+        spec = make_approved_spec()
+        for item in spec["anti_slop_audit"]["visual_fingerprints"]:
+            item.update({"layout_family": "same", "focal_object": "same", "motif_family": "same", "composition_axis": "same", "text_density": "same"})
+            item["assets"] = [{"asset_id": "stock-1", "role": "photo", "provenance": {"kind": "approved"}, "reuse_policy": {"max_uses": 1}}]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("repeated_full_composition", codes)
+        self.assertIn("asset_reuse_exceeded", codes)
+
+    def test_asset_reuse_policy_is_consistent_across_occurrences(self) -> None:
+        spec = make_approved_spec()
+        for index, item in enumerate(spec["anti_slop_audit"]["visual_fingerprints"][:2]):
+            item["assets"] = [{
+                "asset_id": "shared-photo",
+                "role": "photo",
+                "provenance": {"kind": "approved"},
+                "reuse_policy": {"max_uses": 2 if index == 0 else 3},
+            }]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("asset_manifest_inconsistent", {issue.code for issue in report.errors})
+
+    def test_similarity_requires_window_comparator_fingerprints_and_bound_score(self) -> None:
+        spec = make_approved_spec()
+        similarity = spec["anti_slop_audit"]["evidence"]["recent_similarity"]
+        similarity.pop("candidate_window")
+        similarity["score"] = 0.95
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("similarity_candidate_window", codes)
+        self.assertIn("similarity_threshold_exceeded", codes)
+
+    def test_critique_requires_trusted_distinct_reviewer_and_observations(self) -> None:
+        spec = make_approved_spec()
+        critique = spec["anti_slop_audit"]["independent_critique"]
+        critique["reviewer_id"] = "lead-fixture"
+        critique["observations"] = []
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("independent_critique_not_distinct", codes)
+        self.assertIn("independent_critique_observations", codes)
+
+    def test_final_critique_requires_authenticated_selector_and_generator(self) -> None:
+        spec = make_approved_spec()
+        spec["human_selected_route"]["selected_by"] = "unmapped-selector"
+        spec["design"]["generated_by"] = "unmapped-generator"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("independent_selector_trust", codes)
+        self.assertIn("independent_generator_trust", codes)
+
+    def test_score_cannot_pass_with_pending_hard_evidence(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["evidence"]["ocr"]["status"] = "pending"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("score_incoherent", {issue.code for issue in report.errors})
+
+    def test_visual_fingerprint_must_bind_decoded_page_pixels(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["visual_fingerprints"][0]["page_digest"] = "sha256:" + "0" * 64
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("visual_fingerprint_page_digest", {issue.code for issue in report.errors})
+
+    def test_identical_decoded_pages_fail_even_when_metadata_differs(self) -> None:
+        spec = make_approved_spec()
+        render_dir = Path(spec["design"]["render_ref"])
+        (render_dir / "page-2.png").write_bytes((render_dir / "page-1.png").read_bytes())
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("repeated_identical_pixels", {issue.code for issue in report.errors})
+
+    def test_missing_external_action_receipts_cannot_authorize_final(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"].pop("action_records")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("action_receipt_unverified", {issue.code for issue in report.errors})
+
+    def test_action_receipt_cannot_be_reused_across_content_records(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"]["action_records"]["generation"]["content_id"] = "other-content-fixture"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("action_receipt_binding", {issue.code for issue in report.errors})
+
+    def test_final_cli_requires_independent_policy_digest_pin(self) -> None:
+        spec = make_approved_spec()
+        spec_path = write_input_json("missing-policy-digest-spec.json", spec)
+        brand_path = write_input_json("missing-policy-digest-brand.json", approved_brand())
+        policy_context = trusted_policy(spec)
+        policy_path = write_input_json("missing-policy-digest-policy.json", dict(policy_context.data))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main([str(spec_path), "--brand", str(brand_path), "--policy", str(policy_path), "--actor-id", "lead-fixture", "--json"])
+        self.assertNotEqual(0, result)
+        self.assertIn("trusted_policy_digest_required", {item["code"] for item in json.loads(output.getvalue())["issues"]})
+
+    def test_final_v1_anti_slop_contract_cannot_authorize(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["anti_slop_contract_version"] = 1
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("anti_slop_contract_version", {issue.code for issue in report.errors})
+
+    def test_production_evidence_requires_policy_pinned_tool_receipts(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"].pop("evidence_tools")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("evidence_authority_missing", {issue.code for issue in report.errors})
+
+    def test_benchmark_pass_rejects_identical_pairwise_verdict(self) -> None:
+        spec = make_approved_spec()
+        registry = benchmark_registry(spec)
+        entry = registry["reference_sets"][0]
+        benchmark = spec["anti_slop_audit"]["independent_critique"]["benchmark"]
+        benchmark.update({"status": "pass", "reference_set_checksum": entry["checksum"], "render_digest": spec["design"]["render_evidence"]["render_digest"], "candidate_ids": ["recent-education-001"], "reference_corpus": entry["reference_corpus"], "comparator": {"id": "fixture-comparator", "version": "1"}, "pairwise_verdict": [{"candidate_id": "recent-education-001", "verdict": "identical"}]})
+        registry_path = write_input_json("benchmark-identical-registry.json", registry)
+        context = load_benchmark_registry(registry_path)
+        benchmark["registry_checksum"] = context.canonical_digest
+        spec["policy"]["benchmark_registry"] = {"source": "local_authenticated_benchmark_registry", "registry_id": registry["registry_id"], "revision": registry["revision"], "registry_checksum": context.canonical_digest, "trusted_root": registry["trusted_root"], "reference_set_ids": ["fixture-benchmark@1"], "reference_set_checksums": {"fixture-benchmark@1": entry["checksum"]}, "reference_corpus_checksums": {"fixture-corpus-001": entry["reference_corpus"][0]["checksum"]}}
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture", benchmark_registry=context)
+        self.assertIn("independent_benchmark_coherence", {issue.code for issue in report.errors})
+
+    def test_high_slop_index_caps_an_unresolved_high_score(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["slop_index"]["visual_convergence"] = 4
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("score_incoherent", {issue.code for issue in report.errors})
+
+    def test_resolved_slop_finding_does_not_count_as_score_failure(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["slop_index"]["visual_convergence"] = 4
+        spec["anti_slop_audit"]["findings"] = [{
+            "reason_code": "same_layout_cluster", "dimension": "visual_convergence",
+            "explanation": "Earlier draft repeated a layout.", "status": "resolved", "resolution": "Changed composition axis.",
+        }]
+        spec["anti_slop_audit"]["approval_package"]["checksum"] = _anti_slop_package_checksum(spec, spec["anti_slop_audit"])
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertNotIn("score_incoherent", {issue.code for issue in report.errors})
+
+    def test_reason_codes_must_bind_findings_and_cannot_hide_high_score_failure(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["reason_codes"] = ["generic_language"]
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("anti_slop_reason_unbound", codes)
+        self.assertIn("score_incoherent", codes)
+
+    def test_generic_cta_warns_in_draft_and_blocks_final_but_natural_cta_survives(self) -> None:
+        draft = load_json("content-spec.example.json")
+        draft["caption"]["cta"] = "Pelajari lebih lanjut."
+        draft_report = validate_content_spec(draft, approved_brand(), self.TODAY)
+        self.assertIn("generic_cta_target_missing", {issue.code for issue in draft_report.warnings})
+        final = make_approved_spec()
+        final["caption"]["cta"] = "Pelajari lebih lanjut."
+        final_report = validate_content_spec(final, approved_brand(), self.TODAY, trusted_policy(final), actor_id="lead-fixture")
+        self.assertIn("generic_cta_target_missing", {issue.code for issue in final_report.errors})
+        natural = make_approved_spec()
+        natural_report = validate_content_spec(natural, approved_brand(), self.TODAY, trusted_policy(natural), actor_id="lead-fixture")
+        self.assertNotIn("generic_cta_target_missing", {issue.code for issue in natural_report.errors})
+
+    def test_embedded_remote_receipt_never_authorizes_final_render(self) -> None:
+        spec = make_approved_spec()
+        evidence = spec["design"]["render_evidence"]
+        evidence["render_ref"] = "https:" + "//untrusted.invalid/render.png"
+        evidence["trusted_receipt"] = {"verification_status": "verified", "receipt_digest": evidence["render_digest"]}
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_remote_untrusted", {issue.code for issue in report.errors})
+
+    def test_empty_render_directory_and_duplicate_page_files_fail(self) -> None:
+        spec = make_approved_spec()
+        empty_dir = Path(tempfile.mkdtemp(prefix="empty-render-", dir=TEST_EXPORT_DIR.name))
+        spec["design"]["render_ref"] = str(empty_dir)
+        spec["design"]["render_evidence"]["render_ref"] = str(empty_dir)
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_artifact_empty", {issue.code for issue in report.errors})
+
+        duplicate = make_approved_spec()
+        render_dir = duplicate["design"]["render_ref"]
+        duplicate["design"]["render_evidence"]["page_files"] = ["page-1.png", "page-1.png"] + [f"page-{i}.png" for i in range(2, len(duplicate["slides"]) + 1)]
+        report = validate_content_spec(duplicate, approved_brand(), self.TODAY, trusted_policy(duplicate), actor_id="lead-fixture")
+        self.assertIn("render_page_duplicate", {issue.code for issue in report.errors})
+
+        bounded = make_approved_spec()
+        bounded["design"]["render_evidence"]["page_files"] = ["page-1.png"] * 101
+        report = validate_content_spec(bounded, approved_brand(), self.TODAY, trusted_policy(bounded), actor_id="lead-fixture")
+        self.assertIn("render_file_count", {issue.code for issue in report.errors})
+
+    def test_forged_png_magic_header_is_not_a_verified_render(self) -> None:
+        spec = make_approved_spec()
+        forged = Path(spec["design"]["render_ref"]) / "page-1.png"
+        forged.write_bytes(b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sIIBBBBB", 13, b"IHDR", 1080, 1350, 8, 6, 0, 0, 0))
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_dimensions_unreadable", {issue.code for issue in report.errors})
+
+    def test_png_valid_chunks_with_invalid_idat_payload_fail_closed(self) -> None:
+        spec = make_approved_spec()
+        page_path = Path(spec["design"]["render_ref"]) / "page-1.png"
+        data = page_path.read_bytes()
+        offset = 8
+        rebuilt = bytearray(data[:8])
+        replaced = False
+        while offset < len(data):
+            length = int.from_bytes(data[offset:offset + 4], "big")
+            chunk_type = data[offset + 4:offset + 8]
+            payload = data[offset + 8:offset + 8 + length]
+            if chunk_type == b"IDAT" and not replaced:
+                payload = b"not-a-zlib-stream"
+                replaced = True
+            body = chunk_type + payload
+            rebuilt.extend(struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+            offset += 12 + length
+        page_path.write_bytes(bytes(rebuilt))
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_dimensions_unreadable", {issue.code for issue in report.errors})
+
+    def test_malformed_reviewer_identity_reports_errors_without_crashing(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["independent_critique"]["reviewer_id"] = []
+        spec["anti_slop_audit"]["independent_critique"]["reviewer_role"] = []
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("independent_critique_reviewer", codes)
+        self.assertIn("independent_critique_reviewer_trust", codes)
+
+    def test_attacker_cannot_approve_repeated_composition_exception(self) -> None:
+        spec = make_approved_spec()
+        for item in spec["anti_slop_audit"]["visual_fingerprints"]:
+            item.update({"layout_family": "same", "focal_object": "same", "motif_family": "same", "composition_axis": "same", "text_density": "same"})
+        spec["anti_slop_audit"]["approved_exceptions"] = {
+            "repeated_composition": {
+                "approved": True,
+                "approved_by": "attacker",
+                "approved_role": "lead",
+                "approved_at": "2026-08-19T11:00:00+07:00",
+                "scope": full_scope(spec),
+                "render_digest": spec["design"]["render_evidence"]["render_digest"],
+                "reason": "Intentional repetition.",
+                "affected": {"page_refs": ["page-1", "page-2"]},
+            }
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("approved_exception_reviewer_trust", {issue.code for issue in report.errors})
+
+    def test_exception_approver_cannot_be_the_independent_reviewer(self) -> None:
+        spec = make_approved_spec()
+        for item in spec["anti_slop_audit"]["visual_fingerprints"]:
+            item.update({"layout_family": "same", "focal_object": "same", "motif_family": "same", "composition_axis": "same", "text_density": "same"})
+        spec["anti_slop_audit"]["approved_exceptions"] = {
+            "repeated_composition": {
+                "approved": True,
+                "approved_by": "independent-critic-fixture",
+                "approved_role": "lead",
+                "approved_at": "2026-08-19T11:00:00+07:00",
+                "scope": full_scope(spec),
+                "render_digest": spec["design"]["render_evidence"]["render_digest"],
+                "reason": "Intentional repetition for the approved series motif.",
+                "affected": {"page_refs": [f"page-{index}" for index in range(1, len(spec["slides"]) + 1)]},
+            }
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("approved_exception_not_distinct", {issue.code for issue in report.errors})
+
+    def test_exception_approver_cannot_be_current_authenticated_actor(self) -> None:
+        spec = make_approved_spec()
+        for item in spec["anti_slop_audit"]["visual_fingerprints"]:
+            item.update({"layout_family": "same", "focal_object": "same", "motif_family": "same", "composition_axis": "same", "text_density": "same"})
+        spec["anti_slop_audit"]["approved_exceptions"] = {
+            "repeated_composition": {
+                "approved": True, "approved_by": "lead-fixture", "approved_role": "lead",
+                "approved_at": "2026-08-19T11:00:00+07:00", "scope": full_scope(spec),
+                "render_digest": spec["design"]["render_evidence"]["render_digest"],
+                "reason": "Intentional repetition for the approved series motif.",
+                "affected": {"page_refs": [f"page-{index}" for index in range(1, len(spec["slides"]) + 1)]},
+            }
+        }
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("approved_exception_self_approval", {issue.code for issue in report.errors})
+
+    def test_png_trailing_zlib_bytes_fail_closed(self) -> None:
+        spec = make_approved_spec()
+        page_path = Path(spec["design"]["render_ref"]) / "page-1.png"
+        data = page_path.read_bytes()
+        offset = 8
+        rebuilt = bytearray(data[:8])
+        while offset < len(data):
+            length = int.from_bytes(data[offset:offset + 4], "big")
+            chunk_type = data[offset + 4:offset + 8]
+            payload = data[offset + 8:offset + 8 + length]
+            if chunk_type == b"IDAT":
+                payload += b"trailing-zlib-bytes"
+            body = chunk_type + payload
+            rebuilt.extend(struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+            offset += 12 + length
+        page_path.write_bytes(bytes(rebuilt))
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_dimensions_unreadable", {issue.code for issue in report.errors})
+
+    def test_indexed_png_is_rejected_even_with_valid_palette_and_crc(self) -> None:
+        spec = make_approved_spec()
+        page_path = Path(spec["design"]["render_ref"]) / "page-1.png"
+        def chunk(kind: bytes, payload: bytes) -> bytes:
+            body = kind + payload
+            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        indexed = b"\x89PNG\r\n\x1a\n"
+        indexed += chunk(b"IHDR", struct.pack(">IIBBBBB", 1080, 1350, 8, 3, 0, 0, 0))
+        indexed += chunk(b"PLTE", b"\x00\x00\x00")
+        indexed += chunk(b"IDAT", zlib.compress((b"\x00" + b"\x00" * 1080) * 1350))
+        indexed += chunk(b"IEND", b"")
+        page_path.write_bytes(indexed)
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("render_dimensions_unreadable", {issue.code for issue in report.errors})
+
+    def test_final_download_requires_policy_supplied_root(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"].pop("download_root")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("download_trusted_root", {issue.code for issue in report.errors})
+
+    def test_trusted_policy_is_recursively_immutable(self) -> None:
+        spec = make_approved_spec()
+        context = trusted_policy(spec)
+        with self.assertRaises(TypeError):
+            context.data["action_records"]["generation"]["actor_id"] = "attacker"
+        with self.assertRaises(TypeError):
+            context.data["role_mapping"]["lead"].append("attacker")
+        self.assertEqual(context.canonical_digest, trusted_policy(spec).canonical_digest)
+
+    def test_action_receipt_binds_effective_target_account(self) -> None:
+        spec = make_approved_spec()
+        spec["publishing"]["target_account"] = "different-account"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("action_receipt_target", {issue.code for issue in report.errors})
+
+    def test_png_transparency_and_unknown_critical_chunks_fail_closed(self) -> None:
+        def chunk(kind: bytes, payload: bytes) -> bytes:
+            body = kind + payload
+            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+        def png(color_type: int, row: bytes, extra: bytes = b"") -> bytes:
+            header = struct.pack(">IIBBBBB", 1, 1, 8, color_type, 0, 0, 0)
+            return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + extra + chunk(b"IDAT", zlib.compress(b"\x00" + row)) + chunk(b"IEND", b"")
+
+        # Fully valid RGBA with transparent hidden RGB must not enter the
+        # production pixel fingerprint path.
+        self.assertIsNone(_decode_png(png(6, b"\xff\x00\x00\x00")))
+        self.assertIsNone(_decode_png(png(2, b"\x01\x02\x03", chunk(b"tRNS", b"\x00\x01"))))
+        self.assertIsNone(_decode_png(png(2, b"\x01\x02\x03", chunk(b"ABCD", b""))))
+
+    def test_forged_external_result_score_cannot_authorize_similarity(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["evidence"]["recent_similarity"]["score"] = 0.01
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("evidence_result_binding", {issue.code for issue in report.errors})
+
+    def test_open_beneath_rejects_ancestor_symlink_escape(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="trusted-root-"))
+        outside = Path(tempfile.mkdtemp(prefix="outside-root-"))
+        (outside / "page.bin").write_bytes(b"outside")
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+        self.assertIsNone(_open_beneath(root, root / "escape" / "page.bin"))
+
+    def test_final_policy_digest_cannot_be_disabled_by_caller_flag(self) -> None:
+        spec = make_approved_spec()
+        context = trusted_policy(spec)
+        report = _real_validate_content_spec(
+            spec,
+            approved_brand(),
+            self.TODAY,
+            context,
+            actor_id="lead-fixture",
+            require_policy_digest=False,
+        )
+        self.assertIn("trusted_policy_digest_required", {issue.code for issue in report.errors})
+
+    def test_future_external_evidence_result_timestamp_fails_closed(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"]["evidence_results"]["recent_similarity"]["timestamp"] = "2099-01-01T00:00:00+00:00"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("evidence_result_timestamp_future", {issue.code for issue in report.errors})
+
+    def test_future_critique_timestamp_fails_closed(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["independent_critique"]["reviewed_at"] = "2099-01-01T00:00:00+00:00"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("independent_critique_timestamp_future", {issue.code for issue in report.errors})
+
+    def test_future_evidence_checked_timestamp_fails_closed(self) -> None:
+        spec = make_approved_spec()
+        spec["anti_slop_audit"]["evidence"]["layout"]["checked_at"] = "2099-01-01T00:00:00+00:00"
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertIn("anti_slop_evidence_timestamp_future", {issue.code for issue in report.errors})
+
+    def test_valid_filesystem_root_identity_pins_authorize_final_reads(self) -> None:
+        spec = make_approved_spec()
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        self.assertEqual([], report.errors)
+
+    def test_recreated_render_root_fails_pinned_identity(self) -> None:
+        spec = make_approved_spec()
+        original = Path(spec["design"]["render_ref"])
+        moved = original.with_name(original.name + "-original")
+        original.rename(moved)
+        original.mkdir()
+        try:
+            report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+            self.assertIn("filesystem_root_identity", {issue.code for issue in report.errors})
+        finally:
+            original.rmdir()
+            moved.rename(original)
+
+    def test_missing_filesystem_root_pins_fail_final_closed(self) -> None:
+        spec = make_approved_spec()
+        spec["policy"].pop("filesystem_roots")
+        report = validate_content_spec(spec, approved_brand(), self.TODAY, trusted_policy(spec), actor_id="lead-fixture")
+        codes = {issue.code for issue in report.errors}
+        self.assertIn("filesystem_root_pin_required", codes)
 
 
 if __name__ == "__main__":

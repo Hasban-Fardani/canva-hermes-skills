@@ -62,6 +62,36 @@ recent-similarity evidence, an independent critique, and the exact
 the selected route, render digest, export checksum, caption, target, and
 schedule; any change returns the record to review.
 
+For `BRAND_QA` and later, the render receipt must point to non-empty local
+raster page files. Remote-only/free-form references fail closed because an
+embedded receipt cannot self-certify; the current validator has no external
+authoritative receipt input. The declared SHA-256, page count, dimensions, and
+per-page `page_map` (path/hash/index/ref) are checked before evidence is
+accepted. Pages must be unique, contained regular files with no symlink
+components. Layout, OCR, semantic, similarity, fingerprint, and critique
+receipts must all repeat the same `render_digest`; exception approvals must be
+mapped by trusted policy and bind scope, target, reason, time, and digest. A
+benchmark comparison may claim `pass` only when the CLI receives an external
+`--benchmark-registry` whose scoped approved reference set, registry file
+digest/ID/revision, corpus checksums, candidate/render binding, and reviewer
+permission are pinned by the separately loaded trusted policy; otherwise
+record `pending` or `cannot_verify` and retain human observations. Final
+selection/generation also require policy-pinned action receipts. A role list is
+not proof that an action occurred.
+
+Render input is bounded before hashing (100 pages, 100 MiB per page, 500 MiB
+total, 100 MiB decoded PNG pixels). The validator fully decodes supported
+non-interlaced 8-bit opaque grayscale/truecolor PNG zlib/filter streams,
+rejects indexed, alpha/tRNS, unknown-critical, and malformed image bytes.
+Pass evidence references immutable policy-pinned result receipts with exact
+content/render/page/fingerprint/result bindings. Final CLI validation also
+requires `--policy-digest`, supplied by secure runtime configuration rather
+than the content workspace. Final local download roots come from that
+verified policy/runtime input; a record cannot choose its own trusted root.
+Production render/download roots additionally require pinned canonical path,
+device, and inode identity; refresh the pin after an intentional directory
+recreation.
+
 Download successful media immediately with
 `scripts/download_canva_export.py`, preferably using its bounded standard-input
 mode for the signed address. The helper accepts no credentials or custom

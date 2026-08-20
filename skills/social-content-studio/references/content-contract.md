@@ -126,17 +126,75 @@ and a weighted 100-point rubric:
 
 The audit evidence keys are `ocr`, `layout`, `semantic`, `wcag`, `rights`, and
 `recent_similarity`. OCR must record exact match; layout must record no
-overflow/collision; semantic evidence covers object/count/color/relation/CTA
-contracts; WCAG evidence records contrast; and rights evidence records asset
-provenance/permission. `independent_critique` must identify a separate
-reviewer and findings. `hard_blockers` include scope, claim/evidence, rights,
-OCR, layout, semantic, WCAG, template controls, and approval-package checks.
-Any failed or pending blocker rejects a Canva mutation or final state.
+overflow/collision; semantic evidence covers structured expected/observed
+objects, count/relation/copy-image-job/CTA-target checks; WCAG evidence records
+contrast; and rights evidence records asset provenance/permission. In a
+`BRAND_QA` or later state, `design.render_evidence` must resolve to non-empty
+local raster page files, match the declared SHA-256, page count, and
+`design.dimensions`, and include a `page_map` binding each page index/ref to
+the exact contained file path and hash. Page files must be unique, regular,
+non-symlink files under `render_ref`; the validator uses bounded format
+parsers and fully validates non-interlaced 8-bit opaque grayscale/truecolor
+PNG zlib/filter streams (rejecting alpha/tRNS and unknown critical chunks),
+rejecting indexed, unsupported, header-only, or inconsistent image bytes. The render
+input is bounded to 100 pages, 100 MiB per page, 500 MiB total, and 100 MiB
+decoded PNG pixels. Fingerprints bind a `page_digest` (and optional conservative
+coarse digest) to those decoded pixels;
+exact repeated page pixels fail even when metadata differs unless an
+identity-only exception is approved. Remote-only or
+free-form references fail closed because an embedded receipt cannot
+self-certify; passing production checks require a separately loaded,
+policy-pinned authoritative result receipt. Local render/download files are opened by descriptor-relative
+component walks with no-follow flags; platforms without those primitives fail
+closed. Trusted policy also pins each production root's canonical path,
+`st_dev`, and `st_ino`; a recreated root requires refreshed runtime pins.
+Layout, OCR, semantic, similarity, and critique evidence all
+carry that same `render_digest`; a string such as `"layout passed"` is not
+evidence.
+
+`anti_slop_audit.visual_fingerprints` carries one record per page with layout
+family, focal object, motif family, composition axis, text density, and a
+structured asset manifest (`asset_id`, role, provenance, bounded reuse policy).
+Repeated full compositions and over-reused non-identity assets need an
+explicit structured exception. `independent_critique` must identify a mapped
+reviewer distinct from authenticated generator/selector identities, timestamp,
+method, observations, verdict, benchmark reference-set/version, pairwise
+verdict, page refs, and the same render digest. A benchmark `pass` additionally
+requires `--benchmark-registry` (an independently loaded, scoped, approved
+registry entry with checksum and reviewer permission); without it, final
+records use `pending` or `cannot_verify` and retain human observations. The
+registry file digest, ID, revision, reference-set checksum, reference-corpus
+checksums, and candidate/render binding must also be pinned in the separately
+loaded trusted policy; a caller-selected registry cannot authorize a pass.
+For privileged CLI validation, `--policy-digest` is an independent runtime
+pin. The validator cannot authenticate a malicious caller who controls both
+that pin and the policy file; production runtime must supply the pin from a
+secure configuration boundary outside the content workspace.
+Final route selection and generation require externally pinned action receipts,
+not role-membership strings. Exception approvers must be mapped, distinct from
+the current actor unless an exact-scope policy permits self-approval, and their
+timestamp cannot precede render/selection evidence.
+`hard_blockers` include scope, claim/evidence, rights, OCR,
+layout, semantic, WCAG, template controls, and approval-package checks. Any
+failed or pending blocker rejects a Canva mutation or final state, and a
+passing 80+ score cannot coexist with those findings.
 
 `anti_slop_audit.approval_package` binds full scope, content ID, render digest,
 export checksum, selected route, and a deterministic checksum. The existing
 `approval.package_checksum` also includes the selected route and audit package
-checksum, so changing either after approval invalidates the package.
+checksum, action records, visual fingerprints, exceptions, reason codes, rubric,
+and slop data, so changing any after approval invalidates the package.
+Production evidence uses `anti_slop_contract_version: 2`; explicit v1 records
+remain migration-readable for drafts only and cannot authorize final states.
+Final approval packages declare `checksum_algorithm: anti-slop-v2`; legacy
+checksum algorithms are not transparent final-state compatibility.
+Tool/receipt IDs for OCR, layout, and semantic checks, and comparator IDs for
+similarity/benchmark checks, must be pinned by the verified policy. Passing
+evidence must also reference a recursively frozen policy-pinned result receipt
+whose digest binds the content, render, page refs/fingerprints, exact score or
+verdict, observations, timestamp, and scope. Production evidence, result, and
+independent-critique timestamps must not be future-dated beyond a small clock
+skew and must follow render, selection, and action receipts.
 
 ### Indonesian fluency and register review
 

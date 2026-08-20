@@ -90,6 +90,41 @@ Use this skill to:
    obtain `human_selected_route`, and record one art direction with exactly one
    distinctive move. Canva mutation, export, approval, scheduling, and
    publishing fail closed when that evidence is missing.
+13. For Brand QA and final states, bind every render-derived check to one real
+    non-empty local render artifact. Verify its SHA-256, page count, and pixel
+    dimensions. Remote-only/free-form references remain unverified until an
+    external authoritative receipt input is supported; an embedded receipt
+    cannot self-certify. Layout, semantic, fingerprint, similarity, and
+    critique records must be structured per page; a self-attested pass string
+    is not proof.
+14. The validator bounds final render inputs at 100 pages, 100 MiB per page,
+    500 MiB total, and 100 MiB decoded PNG pixels. It fully validates the
+    supported non-interlaced 8-bit opaque grayscale/truecolor PNG stream
+    (CRC, bounded zlib payload, filters, no alpha/tRNS, and no unknown
+    critical chunks), binds fingerprints to decoded pixel digests, and rejects
+    exact repeated pixels unless an identity-only exception is externally
+    approved; indexed and unsupported/malformed image formats fail closed.
+15. A production benchmark comparison is not self-authenticating. Use
+    `--benchmark-registry` with an independently loaded, scoped, approved
+    registry whose ID, revision, file digest, reference corpus, and candidate
+    set are pinned by the separately loaded trusted policy, plus reviewer
+    permission, for `benchmark.status=pass`; without it, record `pending` or
+    `cannot_verify` and retain concrete human critique observations. Final
+    selector/generator identities also require externally pinned action
+    receipts; role membership alone is not an action receipt.
+16. Production records use `anti_slop_contract_version=2`. Explicit v1 records
+    remain readable as migration-only drafts but cannot authorize Canva
+    mutation or final states. Pass evidence must name tool/receipt IDs pinned
+    in the verified policy. Pass evidence additionally references immutable,
+    policy-pinned result receipts (not merely registered tools). CLI approval
+    also requires `--policy-digest`, an independently supplied canonical
+    policy pin; final approval packages use `checksum_algorithm=anti-slop-v2`.
+    Never treat a content-file copy as that secure runtime pin. Production
+    evidence/result/critique timestamps cannot be future-dated beyond a small
+    clock skew or precede their render, selection, and action receipts.
+    Production render/download roots also require policy-pinned canonical path,
+    device, and inode identities; refresh those pins when a legitimate root
+    directory is recreated or moved.
 
 ## Choose a mode
 

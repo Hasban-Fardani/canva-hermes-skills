@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import stat
 import sys
-from types import MappingProxyType
+import tempfile
+import zlib
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
@@ -57,6 +62,11 @@ ANTI_SLOP_EVIDENCE_KEYS = (
     "recent_similarity",
 )
 ANTI_SLOP_EVIDENCE_STATUSES = {"pending", "pass", "fail", "not_applicable"}
+ANTI_SLOP_RENDER_EVIDENCE_KEYS = ("ocr", "layout", "semantic", "recent_similarity")
+ANTI_SLOP_FINAL_STATES = {"BRAND_QA", "HUMAN_APPROVED", "SCHEDULED", "PUBLISHED", "MEASURED"}
+ANTI_SLOP_CONTRACT_VERSION = 2
+ANTI_SLOP_CHECKSUM_ALGORITHM = "anti-slop-v2"
+BENCHMARK_VERDICTS = {"distinct", "different", "pass", "not_distinct", "same", "identical", "reject", "fail"}
 ANTI_SLOP_HARD_BLOCKER_KEYS = {
     "scope_alignment", "source_and_claim_evidence", "rights_provenance",
     "ocr_exact_match", "layout_integrity", "semantic_contract",
@@ -256,6 +266,20 @@ GENERIC_ROUTE_RE = re.compile(
     r"\b(?:solusi|layanan)\s+(?:inovatif|terbaik|mudah|cepat|aman|terpercaya)\b",
     re.IGNORECASE,
 )
+GENERIC_CTA_RE = re.compile(
+    r"^(?:pelajari\s+lebih\s+lanjut|learn\s+more|hubungi\s+(?:kami|tim)|contact\s+us|"
+    r"klik\s+di\s+sini|click\s+here|ikuti\s+(?:kami|akun)|follow\s+us|"
+    r"baca\s+selengkapnya|selengkapnya|daftar\s+sekarang|sign\s+up\s+now|"
+    r"coba\s+sekarang|try\s+now|mulai\s+sekarang|get\s+started|"
+    r"temukan\s+lebih\s+banyak|discover\s+more|bagikan\s+sekarang|share\s+now)"
+    r"[.!?…]*$",
+    re.IGNORECASE,
+)
+GENERIC_DECORATIVE_RATIONALE_RE = re.compile(
+    r"\b(?:adds?\s+(?:energy|interest|depth|personality)|visual\s+interest|make(?:s)?\s+it\s+pop|"
+    r"fill(?:s)?\s+(?:space|the\s+page)|menambah\s+(?:energi|minat|daya\s+tarik)|hiasan|ornamen)\b",
+    re.IGNORECASE,
+)
 
 DEFAULT_BUDGETS = {
     "headline_chars": 60,
@@ -287,6 +311,17 @@ SAFE_REGISTRY_ID_RE = SAFE_SCOPE_ID_RE
 POLICY_ROLES = {"admin", "lead", "reviewer", "member", "publisher"}
 IDENTITY_SOURCES = {"authenticated", "local_policy", "local_authenticated_policy"}
 TRUSTED_POLICY_SOURCE = "local_authenticated_policy"
+TRUSTED_BENCHMARK_SOURCE = "local_authenticated_benchmark_registry"
+
+# Render validation is intentionally bounded before any bytes are hashed or
+# decoded. These limits keep a malformed final record from turning validation
+# into an unbounded file walk/decompression job.
+MAX_RENDER_FILES = 100
+MAX_RENDER_FILE_BYTES = 100 * 1024 * 1024
+MAX_RENDER_TOTAL_BYTES = 500 * 1024 * 1024
+MAX_RENDER_DECODED_BYTES = 100 * 1024 * 1024
+MAX_DOWNLOAD_FILE_BYTES = 500 * 1024 * 1024
+MAX_CLOCK_SKEW = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -301,12 +336,91 @@ class TrustedPolicyContext:
         return self.payload
 
 
+@dataclass(frozen=True)
+class BenchmarkRegistryContext:
+    """Immutable receipt for a benchmark registry loaded outside the record."""
+    payload: Any
+    source_path: str
+    canonical_digest: str
+
+    @property
+    def data(self) -> dict[str, Any]:
+        return self.payload
+
+
 def load_trusted_policy(path: Path) -> TrustedPolicyContext:
     data = _load_json(path)
     if not isinstance(data, dict):
         raise ValueError("Trusted policy file must contain an object")
-    canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return TrustedPolicyContext(MappingProxyType(data), str(path.resolve()), "sha256:" + hashlib.sha256(canonical).hexdigest())
+    # Freeze the complete copied tree before deriving the digest.  A
+    # top-level proxy is insufficient: nested action receipts/evidence maps
+    # must not remain caller-mutable after authority is loaded.
+    frozen = _freeze_json(copy.deepcopy(data))
+    canonical_digest = _canonical_json_digest(frozen)
+    if canonical_digest is None:
+        raise ValueError("Trusted policy contains non-canonical JSON data")
+    return TrustedPolicyContext(frozen, str(path.resolve()), canonical_digest)
+
+
+def load_benchmark_registry(path: Path) -> BenchmarkRegistryContext:
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        raise ValueError("Benchmark registry file must contain an object")
+    # The validator must not retain caller-owned nested lists/dicts.  A
+    # registry is authority input, so freeze a deep copy before validating it.
+    frozen = _freeze_json(copy.deepcopy(data))
+    canonical_digest = _canonical_json_digest(frozen)
+    if canonical_digest is None:
+        raise ValueError("Benchmark registry contains non-canonical JSON data")
+    return BenchmarkRegistryContext(frozen, str(path.resolve()), canonical_digest)
+
+
+def _freeze_json(value: Any) -> Any:
+    """Recursively freeze JSON values used as external authority inputs."""
+
+    if isinstance(value, dict):
+        return _FrozenDict({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _FrozenList(_freeze_json(item) for item in value)
+    return value
+
+
+class _FrozenDict(dict):
+    """Dict-compatible immutable JSON object for trusted authority data."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("trusted authority data is immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
+
+
+class _FrozenList(list):
+    """List-compatible immutable JSON array for trusted authority data."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("trusted authority data is immutable")
+
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable
+
+
+def _json_plain(value: Any) -> Any:
+    """Convert frozen authority values back to JSON primitives for hashing."""
+
+    if isinstance(value, Mapping):
+        return {key: _json_plain(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_plain(item) for item in value]
+    return value
+
+
+def _canonical_json_digest(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(_json_plain(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 POLICY_MODES = {"attended", "unattended"}
 MEASUREMENT_WINDOWS = {"24h", "72h", "7d", "28d"}
 MEASUREMENT_DATA_MODES = {"organic", "paid", "mixed", "unknown"}
@@ -752,6 +866,8 @@ def _validate_trusted_policy(
     policy_context: Any,
     runtime_actor_id: str | None,
     report: Report,
+    expected_policy_digest: str | None = None,
+    require_policy_digest: bool | None = None,
 ) -> None:
     """Require a separately loaded policy authority for privileged states."""
 
@@ -776,6 +892,12 @@ def _validate_trusted_policy(
             report.error("trusted_policy_embedded", "$policy", "The embedded or copied policy snapshot cannot authorize privileged content.")
         report.error("trusted_policy_type", "$policy", "Privileged states require an immutable TrustedPolicyContext produced by load_trusted_policy; arbitrary dictionaries cannot authorize.")
         return
+    if require_policy_digest and not _nonempty_string(expected_policy_digest):
+        report.error("trusted_policy_digest_required", "$policy", "Privileged/final validation requires an independently supplied trusted policy digest pin.")
+    elif expected_policy_digest is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(expected_policy_digest)):
+        report.error("trusted_policy_digest", "$policy", "Trusted policy digest pin must use sha256:<64 lowercase hex characters>.")
+    elif expected_policy_digest is not None and expected_policy_digest != policy_context.canonical_digest:
+        report.error("trusted_policy_digest", "$policy", "Trusted policy canonical digest does not match the independently supplied runtime pin.")
     policy_context = policy_context.data
     if policy_context is spec.get("policy") or policy_context is embedded:
         report.error(
@@ -803,6 +925,15 @@ def _validate_trusted_policy(
         report.error("trusted_policy_revision", "$policy", "Trusted policy ID/revision must match the content policy snapshot.")
     if policy_context.get("role_mapping") != embedded.get("role_mapping"):
         report.error("trusted_policy_roles", "$policy.role_mapping", "Trusted role mapping must match the content snapshot exactly.")
+    embedded_actions = embedded.get("action_records")
+    if embedded_actions is not None and policy_context.get("action_records") != embedded_actions:
+        report.error("trusted_policy_action_records", "$.policy.action_records", "Trusted action records must exactly match the embedded audit snapshot; embedded records are not authority by themselves.")
+    embedded_benchmark_pin = embedded.get("benchmark_registry")
+    if embedded_benchmark_pin is not None and policy_context.get("benchmark_registry") != embedded_benchmark_pin:
+        report.error("trusted_policy_benchmark_registry", "$.policy.benchmark_registry", "Trusted benchmark pin must exactly match the embedded policy snapshot.")
+    for field in ("evidence_tools", "evidence_results", "comparators", "filesystem_roots"):
+        if embedded.get(field) is not None and policy_context.get(field) != embedded.get(field):
+            report.error("trusted_policy_evidence_registry", f"$.policy.{field}", "Trusted evidence/comparator registry must exactly match the embedded policy snapshot.")
     embedded_unattended = embedded.get("unattended")
     if isinstance(embedded_unattended, dict) and embedded_unattended.get("enabled") is True:
         trusted_unattended = policy_context.get("unattended")
@@ -1407,8 +1538,42 @@ def _parse_datetime(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _timestamp_is_future(value: Any) -> bool:
+    parsed = value if isinstance(value, datetime) else _parse_datetime(value)
+    return parsed is not None and parsed > datetime.now(timezone.utc) + MAX_CLOCK_SKEW
+
+
 def _normalize_cta(value: str) -> str:
     return re.sub(r"[^\w]+", " ", value.casefold(), flags=re.UNICODE).strip()
+
+
+def _cta_target_valid(target: Any) -> bool:
+    if not isinstance(target, dict):
+        return False
+    destination = target.get("destination", target.get("target"))
+    owner = target.get("owner", target.get("response_owner"))
+    return _nonempty_string(destination) and _nonempty_string(owner)
+
+
+def _validate_cta_destination(
+    spec: dict[str, Any],
+    state: Any,
+    cta_entries: list[tuple[str, str, Any]],
+    report: Report,
+) -> None:
+    """Keep generic CTAs accountable while preserving concrete natural CTAs."""
+
+    for path, text, target in cta_entries:
+        if not GENERIC_CTA_RE.fullmatch(text.strip()):
+            continue
+        if _cta_target_valid(target):
+            continue
+        severity = report.error if _state_at_least(state, "HUMAN_APPROVED") else report.warning
+        severity(
+            "generic_cta_target_missing",
+            path,
+            "Generic CTA copy needs a concrete destination and accountable owner; concrete natural CTAs such as 'Simpan panduan ini.' remain valid.",
+        )
 
 
 def _tokens(value: str) -> set[str]:
@@ -3169,6 +3334,24 @@ def _validate_art_direction(
                 continue
             if not _nonempty_string(element.get("semantic_role")) or not _nonempty_string(element.get("rationale")):
                 report.error("decorative_element_role", path, "Every decorative element requires semantic_role and rationale.")
+            rationale = element.get("rationale")
+            if _nonempty_string(rationale) and GENERIC_DECORATIVE_RATIONALE_RE.search(rationale):
+                severity = report.error if _state_at_least(state, "HUMAN_APPROVED") else report.warning
+                severity(
+                    "decorative_element_proof_missing",
+                    f"{path}.rationale",
+                    "Decorative rationale must explain a message relationship or reading job; generic energy/interest language is not proof.",
+                )
+            binding_keys = ("message_job", "proof_ids", "source_ids", "message_binding", "semantic_binding")
+            if _state_at_least(state, "HUMAN_APPROVED") and not any(
+                (_nonempty_string(element.get(key)) or isinstance(element.get(key), list) and bool(element.get(key)) or isinstance(element.get(key), dict) and bool(element.get(key)))
+                for key in binding_keys
+            ):
+                report.error(
+                    "decorative_element_proof_missing",
+                    path,
+                    "Final decorative elements need a structured message/proof binding in addition to semantic_role and rationale.",
+                )
 
 
 def _validate_production_controls(
@@ -3408,16 +3591,1856 @@ def _anti_slop_package_checksum(spec: dict[str, Any], audit: dict[str, Any]) -> 
         "independent_critique": audit.get("independent_critique"),
         "render_evidence": design.get("render_evidence"),
         "audit_version": audit.get("schema_version"),
+        "anti_slop_contract_version": audit.get("anti_slop_contract_version"),
+        "checksum_algorithm": ANTI_SLOP_CHECKSUM_ALGORITHM,
         "slop_index": audit.get("slop_index"),
         "rubric_total": (audit.get("rubric") or {}).get("total") if isinstance(audit.get("rubric"), dict) else None,
         "render_digest": package.get("render_digest"),
         "export_checksum": export_checksum,
+        "action_receipts": {
+            "selection": {
+                "actor_id": (spec.get("human_selected_route") or {}).get("selected_by") if isinstance(spec.get("human_selected_route"), dict) else None,
+                "receipt_id": (spec.get("human_selected_route") or {}).get("selection_receipt_id") if isinstance(spec.get("human_selected_route"), dict) else None,
+                "receipt_digest": (spec.get("human_selected_route") or {}).get("selection_receipt_digest") if isinstance(spec.get("human_selected_route"), dict) else None,
+            },
+            "generation": {
+                "actor_id": design.get("generated_by", design.get("created_by")),
+                "receipt_id": design.get("generation_receipt_id"),
+                "receipt_digest": design.get("generation_receipt_digest"),
+            },
+        },
+        "action_records": (spec.get("policy") or {}).get("action_records") if isinstance(spec.get("policy"), dict) else None,
+        "filesystem_roots": (spec.get("policy") or {}).get("filesystem_roots") if isinstance(spec.get("policy"), dict) else None,
     }
+    # These fields are intentionally additive. Legacy records that never had
+    # the hardened visual contract retain their historical checksum shape;
+    # once a field is present (and therefore reviewable), it is approval-bound.
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    fingerprints = audit.get("visual_fingerprints", audit.get("slide_fingerprints", audit.get("fingerprints")))
+    if fingerprints is None:
+        fingerprints = design.get("visual_fingerprints")
+    additive_fields = {
+        "visual_fingerprints": fingerprints,
+        "approved_exceptions": audit.get("approved_exceptions"),
+        "reason_codes": audit.get("reason_codes"),
+        "rubric": audit.get("rubric"),
+        "slop_index": audit.get("slop_index"),
+        "asset_manifests": audit.get("asset_manifests"),
+    }
+    for key, value in additive_fields.items():
+        if value is not None:
+            payload[key] = value
+    if additive_fields["asset_manifests"] is None and isinstance(fingerprints, list):
+        payload["asset_manifests"] = [
+            item.get("assets", item.get("asset_manifest", []))
+            for item in fingerprints
+            if isinstance(item, dict)
+        ]
     manifest = _message_manifest_for_checksum(spec)
     if manifest is not None:
         payload["message_units"] = manifest
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _anti_slop_final_required(spec: dict[str, Any], state: Any) -> bool:
+    """Return whether rendered evidence is an authorization gate.
+
+    Early local drafts remain migratable.  A Brand QA/final state or an
+    explicit mutation operation is a production artifact, so it must be
+    backed by bytes and structured evidence. External result/action receipts
+    are accepted only from separately loaded trusted policy inputs. This
+    distinction keeps old brief-only drafts useful without allowing a remote
+    reference to self-certify a final package.
+    """
+
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    mutation = design.get("canva_mutation") is True or design.get("mutation_status") in {"requested", "succeeded", "committed"}
+    return state in ANTI_SLOP_FINAL_STATES or mutation
+
+
+def _render_page_refs(spec: dict[str, Any]) -> Any:
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    evidence = design.get("render_evidence") if isinstance(design.get("render_evidence"), dict) else {}
+    return evidence.get("page_refs")
+
+
+def _sha256_file(path: Path) -> tuple[str | None, int | None]:
+    fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            return None, before.st_size
+        size = before.st_size
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            return None, size
+        return digest.hexdigest(), size
+    except (OSError, ValueError, TypeError):
+        return None, None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _read_bounded_file(path: Path, maximum: int) -> bytes | None:
+    """Read one stable regular file through an fd opened without symlinks."""
+
+    fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > maximum:
+            return None
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            return None
+        return b"".join(chunks)
+    except (OSError, ValueError, TypeError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _decode_png(data: bytes) -> dict[str, Any] | None:
+    """Fully decode a bounded, non-interlaced 8-bit PNG without vision.
+
+    This deliberately supports only the small subset whose scanlines can be
+    checked with the standard library.  In particular, the zlib stream is
+    consumed incrementally with a strict output bound; ``flush()`` is never
+    used because it could turn malformed input into an unbounded allocation.
+    """
+
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    offset = 8
+    width = height = color_type = None
+    palette = None
+    idat_parts: list[bytes] = []
+    saw_ihdr = saw_idat = saw_iend = False
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset:offset + 4], "big")
+        chunk_type = data[offset + 4:offset + 8]
+        end = offset + 12 + length
+        if length > 64 * 1024 * 1024 or end > len(data):
+            return None
+        chunk = data[offset + 8:offset + 8 + length]
+        crc = int.from_bytes(data[offset + 8 + length:end], "big")
+        if zlib.crc32(chunk_type + chunk) & 0xFFFFFFFF != crc:
+            return None
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or length != 13:
+                return None
+            width = int.from_bytes(chunk[0:4], "big")
+            height = int.from_bytes(chunk[4:8], "big")
+            bit_depth = chunk[8]
+            color_type = chunk[9]
+            if (
+                width <= 0 or height <= 0 or bit_depth != 8
+                # Production fingerprints are derived from decoded pixels.
+                # Alpha/greyscale-alpha and tRNS introduce hidden RGB
+                # ambiguity, so only opaque grayscale and truecolor are
+                # supported by this narrow decoder.
+                or color_type not in {0, 2}
+                or chunk[10] != 0 or chunk[11] != 0 or chunk[12] != 0
+            ):
+                return None
+            saw_ihdr = True
+        elif chunk_type == b"PLTE":
+            if palette is not None or saw_idat or not chunk or len(chunk) % 3 or len(chunk) > 768:
+                return None
+            palette = chunk
+        elif chunk_type == b"IHDR":
+            return None
+        elif chunk_type == b"IDAT":
+            if not saw_ihdr or saw_iend or not length:
+                return None
+            saw_idat = True
+            idat_parts.append(chunk)
+        elif chunk_type == b"IEND":
+            if length != 0 or not saw_idat:
+                return None
+            saw_iend = True
+            offset = end
+            break
+        elif chunk_type == b"tRNS":
+            # Do not accept transparency metadata without compositing it into
+            # a canonical background before hashing.
+            return None
+        elif chunk_type and not (chunk_type[0] & 0x20):
+            # Unknown critical chunks must not be silently ignored.  The
+            # supported format has no other critical chunks.
+            return None
+        # Ancillary chunks are CRC checked but otherwise ignored.
+        offset = end
+    if not saw_ihdr or not saw_idat or not saw_iend or offset != len(data):
+        return None
+    channels = {0: 1, 2: 3}.get(color_type)
+    if channels is None or width is None or height is None:
+        return None
+    row_bytes = width * channels
+    decoded_size = (row_bytes + 1) * height
+    if row_bytes <= 0 or decoded_size > MAX_RENDER_DECODED_BYTES:
+        return None
+    try:
+        decoder = zlib.decompressobj()
+        decoded = bytearray()
+        for part in idat_parts:
+            remaining = decoded_size - len(decoded)
+            if remaining < 0:
+                return None
+            decoded_part = decoder.decompress(part, max(1, remaining + 1))
+            decoded.extend(decoded_part)
+            if len(decoded) > decoded_size or decoder.unconsumed_tail or decoder.unused_data:
+                return None
+        # eof is the only safe completion signal.  Do not call flush: an
+        # incomplete or trailing stream must never be silently normalized.
+        if not decoder.eof or decoder.unconsumed_tail or decoder.unused_data or len(decoded) != decoded_size:
+            return None
+    except (zlib.error, ValueError):
+        return None
+    previous = bytearray(row_bytes)
+    pixels = bytearray()
+    cursor = 0
+    for _ in range(height):
+        if cursor + 1 + row_bytes > len(decoded):
+            return None
+        filter_type = decoded[cursor]
+        cursor += 1
+        row = bytearray(decoded[cursor:cursor + row_bytes])
+        cursor += row_bytes
+        if filter_type == 1:
+            for index in range(row_bytes):
+                row[index] = (row[index] + (row[index - channels] if index >= channels else 0)) & 0xFF
+        elif filter_type == 2:
+            for index in range(row_bytes):
+                row[index] = (row[index] + previous[index]) & 0xFF
+        elif filter_type == 3:
+            for index in range(row_bytes):
+                left = row[index - channels] if index >= channels else 0
+                row[index] = (row[index] + ((left + previous[index]) // 2)) & 0xFF
+        elif filter_type == 4:
+            for index in range(row_bytes):
+                left = row[index - channels] if index >= channels else 0
+                up = previous[index]
+                upper_left = previous[index - channels] if index >= channels else 0
+                predictor = left + up - upper_left
+                pa = abs(predictor - left)
+                pb = abs(predictor - up)
+                pc = abs(predictor - upper_left)
+                nearest = left if pa <= pb and pa <= pc else up if pb <= pc else upper_left
+                row[index] = (row[index] + nearest) & 0xFF
+        elif filter_type != 0:
+            return None
+        previous = row
+        pixels.extend(row)
+    if cursor != len(decoded):
+        return None
+    sampled = bytearray()
+    for sample_y in range(8):
+        y = min(height - 1, (sample_y * height) // 8)
+        for sample_x in range(8):
+            x = min(width - 1, (sample_x * width) // 8)
+            start = (y * width + x) * channels
+            if channels >= 3:
+                # Preserve one-byte changes conservatively; a weighted
+                # integer luminance would collapse nearby values and create
+                # false duplicate fingerprints on small fixture/test pages.
+                sampled.append(max(pixels[start], pixels[start + 1], pixels[start + 2]))
+            else:
+                sampled.append(pixels[start])
+    return {
+        "width": width,
+        "height": height,
+        "page_digest": "sha256:" + hashlib.sha256(bytes(pixels)).hexdigest(),
+        "coarse_hash": hashlib.sha256(bytes(sampled)).hexdigest(),
+    }
+
+
+def _open_root_directory(root: Path) -> int | None:
+    """Walk an absolute directory from a stable ``/`` descriptor."""
+
+    if not hasattr(os, "open") or not hasattr(os, "O_NOFOLLOW") or os.open not in getattr(os, "supports_dir_fd", set()):
+        return None
+    current_fd = None
+    try:
+        root_abs = Path(root).resolve(strict=True)
+        root_parts = tuple(part for part in root_abs.parts if part not in {"", os.sep})
+        if any(part in {"", ".", ".."} for part in root_parts):
+            return None
+        directory_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+        current_fd = os.open(os.sep, directory_flags)
+        for component in root_parts:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except (AttributeError, OSError, ValueError, TypeError):
+        if current_fd is not None:
+            try:
+                os.close(current_fd)
+            except OSError:
+                pass
+        return None
+
+
+def _root_identity(stat_result: os.stat_result) -> tuple[int, int, int]:
+    return (stat_result.st_dev, stat_result.st_ino, stat_result.st_mode)
+
+
+def _open_beneath(
+    root: Path,
+    target: Path,
+    *,
+    expected_root_identity: tuple[int, int, int | None] | None = None,
+    max_components: int = 128,
+) -> int | None:
+    """Open ``target`` beneath ``root`` with an O_NOFOLLOW component walk.
+
+    Resolving a path once and then reopening it leaves an ancestor-swap race.
+    This walk keeps a directory descriptor for every component, uses
+    ``O_NOFOLLOW`` for each open, and therefore fails closed on platforms that
+    cannot provide descriptor-relative opens.
+    """
+
+    if not hasattr(os, "open") or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "supports_dir_fd"):
+        return None
+    if os.open not in getattr(os, "supports_dir_fd", set()):
+        return None
+    opened: list[int] = []
+    try:
+        # Canonicalize the trusted root before deriving components. Keep a
+        # lexical target when it is already beneath that root so O_NOFOLLOW
+        # rejects a final symlink too; only public/private system aliases are
+        # normalized when the lexical target cannot be compared directly.
+        root_abs = Path(root).resolve(strict=True)
+        target_lexical = Path(os.path.abspath(target))
+        target_abs = target_lexical
+        try:
+            target_lexical.relative_to(root_abs)
+            if _path_has_symlink_component(target_lexical, root_abs):
+                return None
+        except ValueError:
+            target_abs = target_lexical.resolve(strict=True)
+        relative = target_abs.relative_to(root_abs)
+        root_parts = tuple(part for part in root_abs.parts if part not in {"", os.sep})
+        parts = relative.parts
+        if not parts or len(root_parts) + len(parts) > max_components or any(part in {"", ".", ".."} for part in (*root_parts, *parts)):
+            return None
+        current_fd = _open_root_directory(root_abs)
+        if current_fd is None:
+            return None
+        opened.append(current_fd)
+        actual_root = _root_identity(os.fstat(current_fd))
+        if expected_root_identity is not None and (
+            actual_root[0] != expected_root_identity[0]
+            or actual_root[1] != expected_root_identity[1]
+            or (expected_root_identity[2] is not None and actual_root[2] != expected_root_identity[2])
+        ):
+            return None
+        for component in parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            opened.append(next_fd)
+            current_fd = next_fd
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+    finally:
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _validate_filesystem_root_pin(
+    policy_context: Any,
+    root_kind: str,
+    root: Path,
+    report: Report,
+    path: str,
+) -> tuple[int, int, int | None] | None:
+    """Require a trusted canonical root path and stable filesystem identity."""
+
+    trusted = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+    roots = trusted.get("filesystem_roots") if isinstance(trusted, Mapping) else None
+    pin = roots.get(root_kind) if isinstance(roots, Mapping) else None
+    if not isinstance(pin, Mapping):
+        report.error("filesystem_root_pin_required", path, f"Production validation requires a trusted filesystem_roots.{root_kind} identity pin.")
+        return None
+    pin_path = pin.get("path")
+    if not _nonempty_string(pin_path):
+        report.error("filesystem_root_pin", f"{path}.path", "Filesystem root pin requires a canonical absolute path.")
+        return None
+    try:
+        root_canonical = Path(root).resolve(strict=True)
+        pinned_canonical = Path(pin_path).resolve(strict=True)
+    except (OSError, ValueError, TypeError):
+        report.error("filesystem_root_pin", f"{path}.path", "Filesystem root pin path must resolve to an existing local directory.")
+        return None
+    if not pinned_canonical.is_absolute() or str(pinned_canonical) != str(pin_path) or pinned_canonical != root_canonical:
+        report.error("filesystem_root_path", f"{path}.path", "Filesystem root pin must exactly match the canonical verified root path.")
+        return None
+    pin_dev = pin.get("st_dev")
+    pin_ino = pin.get("st_ino")
+    pin_mode = pin.get("st_mode")
+    if isinstance(pin_dev, bool) or not isinstance(pin_dev, int) or isinstance(pin_ino, bool) or not isinstance(pin_ino, int):
+        report.error("filesystem_root_identity", path, "Filesystem root pin requires integer st_dev and st_ino values.")
+        return None
+    if pin_mode is not None and (isinstance(pin_mode, bool) or not isinstance(pin_mode, int)):
+        report.error("filesystem_root_identity", f"{path}.st_mode", "Filesystem root st_mode pin must be an integer when supplied.")
+        return None
+    descriptor = _open_root_directory(root_canonical)
+    if descriptor is None:
+        report.error("filesystem_root_identity", path, "Trusted filesystem root could not be opened by stable descriptor walk.")
+        return None
+    try:
+        actual = _root_identity(os.fstat(descriptor))
+    except OSError:
+        report.error("filesystem_root_identity", path, "Trusted filesystem root identity could not be read.")
+        return None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    if actual[0] != pin_dev or actual[1] != pin_ino or (pin_mode is not None and actual[2] != pin_mode):
+        report.error("filesystem_root_identity", path, "Trusted filesystem root device/inode identity does not match the pinned policy snapshot.")
+        return None
+    return (pin_dev, pin_ino, pin_mode)
+
+
+def _read_render_snapshot(
+    path: Path,
+    trusted_root: Path | None = None,
+    expected_root_identity: tuple[int, int, int | None] | None = None,
+) -> dict[str, Any] | None:
+    """Hash, read, and decode a page from one stable descriptor snapshot."""
+
+    fd = None
+    try:
+        root = trusted_root
+        if root is None:
+            # Compatibility callers can inspect a standalone page, but final
+            # validation always supplies the verified render root below.
+            root = path.parent
+        root = Path(root).resolve(strict=True)
+        # Normalize the public/private macOS temp aliases after lexical
+        # symlink checks; containment is then measured against the same
+        # canonical root used by the descriptor walk.
+        target = Path(path).resolve(strict=True)
+        target.relative_to(root)
+        fd = _open_beneath(root, target, expected_root_identity=expected_root_identity)
+        if fd is None:
+            return None
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > MAX_RENDER_FILE_BYTES:
+            return None
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            return None
+        decoded = _decode_png(b"".join(chunks))
+        if decoded is None:
+            return None
+        decoded.update({"sha256": digest.hexdigest(), "size": before.st_size})
+        return decoded
+    except (OSError, ValueError, TypeError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _image_dimensions(path: Path) -> tuple[int, int] | None:
+    """Compatibility helper; production binding uses _read_render_snapshot."""
+
+    snapshot = _read_render_snapshot(path)
+    return (snapshot["width"], snapshot["height"]) if snapshot is not None else None
+
+
+def _render_files(render_ref: Any, evidence: dict[str, Any]) -> tuple[list[Path], str | None]:
+    """Resolve local render pages and return files plus an error label."""
+
+    declared = evidence.get("page_files", evidence.get("artifacts", evidence.get("files")))
+    if not _nonempty_string(render_ref) and declared is None:
+        return [], "missing"
+    if declared is not None:
+        if not isinstance(declared, list) or not declared:
+            return [], "page_files"
+        if len(declared) > MAX_RENDER_FILES:
+            return [], "file_count"
+        root = Path(render_ref).expanduser() if _nonempty_string(render_ref) else None
+        paths: list[Path] = []
+        for item in declared:
+            value = item.get("path", item.get("local_path")) if isinstance(item, dict) else item
+            if not _nonempty_string(value):
+                return [], "page_files"
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute() and root is not None and root.is_dir():
+                candidate = root / candidate
+            paths.append(candidate)
+        return paths, None
+    try:
+        root = Path(render_ref).expanduser()
+    except (TypeError, ValueError):
+        return [], "invalid"
+    if root.is_symlink():
+        return [], "symlink"
+    if root.is_file():
+        return [root], None
+    if not root.is_dir():
+        return [], "missing"
+    paths: list[Path] = []
+    for item in root.iterdir():
+        if item.name.startswith(".") or item.is_symlink() or not item.is_file():
+            continue
+        paths.append(item)
+        if len(paths) > MAX_RENDER_FILES:
+            return [], "file_count"
+    paths.sort(key=lambda item: item.name)
+    return paths, None
+
+
+def _path_has_symlink_component(path: Path, start: Path | None = None) -> bool:
+    """Check symlinks at/under a render root from a trusted filesystem anchor."""
+
+    if start is not None:
+        try:
+            relative_parts = path.relative_to(start).parts
+        except ValueError:
+            return True
+        current = start
+        parts = relative_parts
+    else:
+        current = path
+        parts = ()
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    for part in parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _render_symlink_anchor(path: Path) -> Path:
+    """Choose a lexical anchor that excludes known system temp aliases.
+
+    macOS commonly exposes the same temporary directory through public and
+    private system aliases. Those aliases are allowed only as the *trusted anchor*;
+    every component beneath the anchor is still checked for symlinks and the
+    resolved path is checked for containment.
+    """
+
+    lexical = Path(os.path.abspath(path))
+    try:
+        temp_root = Path(tempfile.gettempdir())
+        candidates = (temp_root, Path(os.sep) / "tmp", Path(os.sep) / "private" / "tmp")
+        for candidate in candidates:
+            if lexical == candidate or candidate in lexical.parents:
+                return candidate
+    except (OSError, ValueError):
+        pass
+    return Path(lexical.anchor)
+
+
+def _safe_download_snapshot(
+    local_path: Path,
+    trusted_root: Path | None = None,
+    expected_root_identity: tuple[int, int, int | None] | None = None,
+) -> tuple[str | None, int | None]:
+    """Read and hash one export through a stable, non-symlink descriptor."""
+
+    # A caller-controlled path without a separately trusted root cannot be
+    # safely opened beneath an authority boundary.
+    if trusted_root is None:
+        return None, None
+    try:
+        lexical = Path(os.path.abspath(local_path))
+        anchor = _render_symlink_anchor(lexical)
+        if _path_has_symlink_component(lexical, anchor):
+            return None, None
+        root_lexical = Path(os.path.abspath(trusted_root))
+        root_anchor = _render_symlink_anchor(root_lexical)
+        if (trusted_root.is_symlink() and root_lexical != root_anchor) or _path_has_symlink_component(root_lexical, root_anchor):
+            return None, None
+        root = trusted_root.resolve(strict=True)
+        resolved = Path(local_path).resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError, TypeError):
+        return None, None
+    fd = None
+    try:
+        fd = _open_beneath(root, resolved, expected_root_identity=expected_root_identity)
+        if fd is None:
+            return None, None
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > MAX_DOWNLOAD_FILE_BYTES:
+            return None, before.st_size
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                return None, before.st_size
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            return None, before.st_size
+        return digest.hexdigest(), before.st_size
+    except (OSError, ValueError, TypeError):
+        return None, None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _canonical_render_files(
+    render_ref: Any,
+    evidence: dict[str, Any],
+    files: list[Path],
+    report: Report,
+    path: str,
+) -> list[Path]:
+    """Resolve pages once, reject symlinks/traversal, and prevent aliases."""
+
+    if not files:
+        return []
+    if not _nonempty_string(render_ref):
+        report.error("render_root_missing", f"{path}.render_ref", "Multiple render pages require a local render_ref directory as their containment root.")
+        return []
+    try:
+        root_input = Path(render_ref).expanduser()
+        root_lexical = Path(os.path.abspath(root_input))
+        root_anchor = _render_symlink_anchor(root_lexical)
+        if (root_input.is_symlink() and root_lexical != root_anchor) or _path_has_symlink_component(root_lexical, root_anchor):
+            report.error("render_symlink_component", f"{path}.render_ref", "Render root and page paths may not contain symlink components.")
+            return []
+        root = root_input.resolve(strict=True)
+    except (OSError, ValueError):
+        report.error("render_root_missing", f"{path}.render_ref", "Render root must resolve to a local file or directory.")
+        return []
+    if root.is_file() and len(files) != 1:
+        report.error("render_root_type", f"{path}.render_ref", "A file render_ref can bind exactly one page; multi-page renders require a directory root.")
+        return []
+    if len(files) > MAX_RENDER_FILES:
+        report.error("render_file_count", f"{path}.page_files", f"Render evidence may contain at most {MAX_RENDER_FILES} page files.")
+        return []
+    canonical: list[Path] = []
+    identities: set[tuple[int, int]] = set()
+    names: set[str] = set()
+    total_bytes = 0
+    for index, file_path in enumerate(files):
+        try:
+            # Compare absolute lexical paths here.  A relative render_ref plus
+            # an absolute page_files entry is valid when the latter is inside
+            # the root, and should not be mistaken for a symlink traversal.
+            file_lexical = Path(os.path.abspath(file_path))
+            file_anchor = root_lexical if root.is_dir() else _render_symlink_anchor(root_lexical)
+            if _path_has_symlink_component(
+                file_lexical,
+                file_anchor,
+            ):
+                raise ValueError("symlink")
+            resolved = file_path.resolve(strict=True)
+            if root.is_dir():
+                resolved.relative_to(root)
+            elif resolved != root:
+                raise ValueError("outside root")
+            stat_result = os.stat(resolved, follow_symlinks=False)
+            if not resolved.is_file() or stat_result.st_size <= 0:
+                raise ValueError("not a non-empty file")
+            if stat_result.st_size > MAX_RENDER_FILE_BYTES:
+                report.error("render_artifact_too_large", f"{path}.page_files[{index}]", f"Each render page must be at most {MAX_RENDER_FILE_BYTES} bytes.")
+                continue
+            total_bytes += stat_result.st_size
+            if total_bytes > MAX_RENDER_TOTAL_BYTES:
+                report.error("render_artifact_total_too_large", f"{path}.page_files", f"Render pages together must be at most {MAX_RENDER_TOTAL_BYTES} bytes.")
+                return []
+            identity = (stat_result.st_dev, stat_result.st_ino)
+            if resolved.as_posix() in names or identity in identities:
+                report.error("render_page_duplicate", f"{path}.page_files[{index}]", "Render page files must be unique by canonical path and inode; a page cannot repeat the same artifact.")
+                continue
+            names.add(resolved.as_posix())
+            identities.add(identity)
+            canonical.append(resolved)
+        except (OSError, ValueError):
+            report.error("render_page_containment", f"{path}.page_files[{index}]", "Every render page must be a non-symlink file contained inside render_ref.")
+    return canonical
+
+
+def _validate_render_binding(
+    spec: dict[str, Any],
+    expected_scope: dict[str, str] | None,
+    state: Any,
+    report: Report,
+    *,
+    policy_context: Any = None,
+    actor_id: str | None = None,
+) -> tuple[str | None, dict[str, dict[str, Any]]]:
+    """Verify a real local render and return digest plus stable page snapshots."""
+
+    if not _anti_slop_final_required(spec, state):
+        return None, {}
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    evidence = design.get("render_evidence")
+    path = "$.design.render_evidence"
+    if not isinstance(evidence, dict):
+        report.error("render_binding_missing", path, "Brand QA/final states require a render evidence receipt bound to an artifact.")
+        return None, {}
+    render_digest = evidence.get("render_digest")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(render_digest)):
+        report.error("render_binding_digest", f"{path}.render_digest", "Render evidence requires sha256:<64 lowercase hex characters>.")
+        return None, {}
+    if evidence.get("receipt_digest") != render_digest:
+        report.error("render_binding_receipt_digest", f"{path}.receipt_digest", "Render receipt digest must exactly match render_digest.")
+    _validate_anti_scope(evidence.get("scope"), f"{path}.scope", expected_scope, report, required=True)
+    if evidence.get("verification_status") != "verified" or not _nonempty_string(evidence.get("receipt_id")):
+        report.error("render_binding_receipt", path, "Render evidence requires a verified typed receipt with a receipt_id.")
+    render_ref = evidence.get("render_ref", design.get("render_ref"))
+    if isinstance(render_ref, str):
+        try:
+            render_path_exists = Path(render_ref).expanduser().exists()
+        except (OSError, ValueError):
+            render_path_exists = False
+        is_remote = _valid_https_url(render_ref) or not render_path_exists
+    else:
+        is_remote = False
+    render_root_for_open: Path | None = None
+    render_root_identity: tuple[int, int, int | None] | None = None
+    if not is_remote:
+        try:
+            render_root_for_open = Path(render_ref).expanduser().resolve(strict=True)
+            if render_root_for_open.is_file():
+                render_root_for_open = render_root_for_open.parent
+            render_root_identity = _validate_filesystem_root_pin(
+                policy_context,
+                "render",
+                render_root_for_open,
+                report,
+                f"{path}.render_ref",
+            )
+        except (OSError, ValueError, TypeError):
+            report.error("filesystem_root_identity", f"{path}.render_ref", "Render root must resolve before filesystem identity can be verified.")
+    files, error = (
+        _render_files(render_ref, evidence) if not is_remote and render_root_identity is not None else ([], "remote" if is_remote else "root_pin")
+    )
+    if error == "file_count":
+        report.error("render_file_count", f"{path}.page_files", f"Render evidence may contain at most {MAX_RENDER_FILES} page files.")
+    if error is None:
+        files = _canonical_render_files(render_ref, evidence, files, report, path)
+    actual_digests: set[str] = set()
+    page_hashes: list[dict[str, str]] = []
+    page_snapshots: dict[str, dict[str, Any]] = {}
+    if error is None and files:
+        for index, file_path in enumerate(files):
+            snapshot = _read_render_snapshot(file_path, render_root_for_open, render_root_identity)
+            if snapshot is None:
+                report.error("render_artifact_invalid", path, "Every local render page must be a readable, non-empty regular file.")
+                report.error("render_dimensions_unreadable", path, "Render pages must expose fully decoded raster dimensions and pixels for deterministic page checks.")
+                continue
+            page_hashes.append({"name": file_path.name, "sha256": snapshot["sha256"]})
+            page_ref = None
+            refs = evidence.get("page_refs")
+            if isinstance(refs, list) and index < len(refs) and _nonempty_string(refs[index]):
+                page_ref = refs[index]
+            if page_ref is not None:
+                page_snapshots[page_ref] = {**snapshot, "path": str(file_path), "page_index": index + 1}
+        if len(page_hashes) == 1:
+            actual_digests.add("sha256:" + page_hashes[0]["sha256"])
+        elif page_hashes:
+            # Stream the canonical page manifest; never concatenate page
+            # payloads into an aggregate buffer.  The page hash and index are
+            # both bound, so reordering or swapping a page changes the digest.
+            aggregate = hashlib.sha256()
+            for index, item in enumerate(page_hashes, start=1):
+                aggregate.update(json.dumps(
+                    {"page_index": index, **item},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"))
+                aggregate.update(b"\n")
+            actual_digests.add("sha256:" + aggregate.hexdigest())
+    elif error is not None and error not in {"remote", "root_pin"}:
+        report.error("render_artifact_missing", f"{path}.render_ref", "Final render_ref must resolve to a non-empty local artifact file or page directory.")
+    if is_remote or error == "remote":
+        report.error(
+            "render_remote_untrusted",
+            f"{path}.render_ref",
+            "Final render evidence must resolve to a verified local artifact; embedded or remote-only receipts cannot self-certify.",
+        )
+    if actual_digests and render_digest not in actual_digests:
+        report.error("render_digest_mismatch", f"{path}.render_digest", "Declared render_digest does not match the local render artifact bytes.")
+    page_count = len(page_hashes)
+    if page_count < 1:
+        report.error("render_artifact_empty", f"{path}.render_ref", "Render evidence must contain at least one verified local page file.")
+    declared_page_count = evidence.get("page_count")
+    if declared_page_count is not None and (
+        isinstance(declared_page_count, bool)
+        or not isinstance(declared_page_count, int)
+        or declared_page_count != page_count
+    ):
+        report.error("render_page_count_declared", f"{path}.page_count", "Declared render page_count must equal the number of verified local page files.")
+    slides = spec.get("slides") if isinstance(spec.get("slides"), list) else []
+    if not isinstance(page_count, int) or page_count != len(slides):
+        report.error("render_page_count", path, "Render page count must exactly match the content slide count.")
+    declared_dimensions = design.get("dimensions")
+    if not isinstance(declared_dimensions, dict):
+        report.error("render_dimensions_declared", "$.design.dimensions", "Render binding requires declared design width and height.")
+    else:
+        expected_dimensions = (declared_dimensions.get("width"), declared_dimensions.get("height"))
+        render_dimensions = evidence.get("dimensions")
+        if render_dimensions is not None and (
+            not isinstance(render_dimensions, dict)
+            or (render_dimensions.get("width"), render_dimensions.get("height")) != expected_dimensions
+        ):
+            report.error("render_dimensions_declared", f"{path}.dimensions", "Any render dimensions declaration must match design.dimensions exactly.")
+    page_refs = evidence.get("page_refs")
+    if not isinstance(page_refs, list) or len(page_refs) != len(slides) or any(not _nonempty_string(ref) for ref in page_refs):
+        report.error("render_page_refs", f"{path}.page_refs", "Render evidence page_refs must contain one non-empty reference per slide.")
+    elif len(set(page_refs)) != len(page_refs):
+        report.error("render_page_refs_unique", f"{path}.page_refs", "Render evidence page_refs must be unique.")
+    page_map = evidence.get("page_map")
+    if not isinstance(page_map, list) or len(page_map) != page_count:
+        report.error("render_page_map", f"{path}.page_map", "Final render evidence requires one page_map record per verified file.")
+    else:
+        root = Path(render_ref).expanduser() if _nonempty_string(render_ref) else None
+        for index, item in enumerate(page_map):
+            item_path = f"{path}.page_map[{index}]"
+            expected_ref = page_refs[index] if isinstance(page_refs, list) and index < len(page_refs) else None
+            expected_hash = page_hashes[index]["sha256"] if index < len(page_hashes) else None
+            if not isinstance(item, dict) or item.get("page_index") != index + 1 or item.get("page_ref") != expected_ref:
+                report.error("render_page_map", item_path, "page_map must bind page_index and page_ref to the verified render order.")
+                continue
+            mapped_path = item.get("path", item.get("local_path"))
+            if not _nonempty_string(mapped_path) or expected_hash is None or item.get("sha256") != expected_hash:
+                report.error("render_page_map_hash", item_path, "page_map must bind the exact SHA-256 of each verified page file.")
+                continue
+            try:
+                mapped = Path(mapped_path).expanduser()
+                if not mapped.is_absolute() and root is not None and root.is_dir():
+                    mapped = root / mapped
+                mapped_root = root if root is not None and root.is_dir() else mapped.parent
+                if _path_has_symlink_component(mapped, mapped_root):
+                    raise ValueError("page map symlink")
+                if mapped.resolve(strict=True) != files[index].resolve(strict=True):
+                    raise ValueError("page map path mismatch")
+            except (OSError, ValueError):
+                report.error("render_page_map_path", f"{item_path}.path", "page_map path must resolve to the verified contained page file.")
+    expected_dimensions = None
+    if isinstance(declared_dimensions, dict):
+        expected_dimensions = (declared_dimensions.get("width"), declared_dimensions.get("height"))
+    for index, snapshot in enumerate(page_snapshots.values()):
+        if expected_dimensions is not None and (snapshot.get("width"), snapshot.get("height")) != expected_dimensions:
+            report.error("render_dimensions_mismatch", f"{path}.pages[{index}]", "Every render page dimension must match design.dimensions exactly.")
+    return str(render_digest), page_snapshots
+
+
+def _structured_measurement_checks(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        status = item.get("status")
+        expected = item.get("expected")
+        actual = item.get("actual")
+        tolerance = item.get("tolerance")
+        if status != "pass":
+            return False
+        if any(isinstance(candidate, bool) or not isinstance(candidate, (int, float)) for candidate in (expected, actual, tolerance)) or tolerance < 0:
+            return False
+        if abs(actual - expected) > tolerance:
+            return False
+    return True
+
+
+def _validate_layout_evidence(
+    value: dict[str, Any],
+    path: str,
+    spec: dict[str, Any],
+    render_digest: str,
+    report: Report,
+    required: bool,
+) -> None:
+    if value.get("render_digest") != render_digest:
+        report.error("evidence_render_binding", f"{path}.render_digest", "Layout evidence must bind the exact render_digest used by the package.")
+    pages = value.get("pages")
+    slides = spec.get("slides") if isinstance(spec.get("slides"), list) else []
+    if not isinstance(pages, list) or len(pages) != len(slides):
+        report.error("layout_pages", f"{path}.pages", "Layout evidence requires one structured page record per slide.")
+        return
+    expected_refs = value.get("page_refs")
+    if isinstance(expected_refs, list) and expected_refs != [page.get("page_ref") for page in pages if isinstance(page, dict)]:
+        report.error("layout_page_refs", f"{path}.page_refs", "Layout page_refs must exactly match the structured page records.")
+    render_refs = _render_page_refs(spec)
+    page_record_refs = [page.get("page_ref") for page in pages if isinstance(page, dict)]
+    if isinstance(render_refs, list) and page_record_refs != render_refs:
+        report.error("layout_render_page_refs", f"{path}.page_refs", "Layout page_refs must exactly match the verified render page map.")
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    design_dimensions = design.get("dimensions") if isinstance(design.get("dimensions"), dict) else {}
+    expected_dimensions = (design_dimensions.get("width"), design_dimensions.get("height"))
+    seen: set[str] = set()
+    for index, page in enumerate(pages):
+        page_path = f"{path}.pages[{index}]"
+        if not isinstance(page, dict):
+            report.error("layout_page_type", page_path, "Each layout page must be an object.")
+            continue
+        page_ref = page.get("page_ref")
+        if not _nonempty_string(page_ref) or (isinstance(page_ref, str) and page_ref in seen):
+            report.error("layout_page_ref", f"{page_path}.page_ref", "Each layout page needs a unique page_ref.")
+        if isinstance(page_ref, str):
+            seen.add(page_ref)
+        dimensions = page.get("dimensions")
+        if not isinstance(dimensions, dict) or (dimensions.get("width"), dimensions.get("height")) != expected_dimensions:
+            report.error("layout_page_dimensions", f"{page_path}.dimensions", "Layout page dimensions must match design.dimensions.")
+        safe_area = page.get("safe_area")
+        safe_valid = isinstance(safe_area, dict) and (
+            all(isinstance(safe_area.get(key), (int, float)) and not isinstance(safe_area.get(key), bool) and safe_area.get(key) >= 0 for key in ("left", "top", "right", "bottom"))
+            or all(isinstance(safe_area.get(key), (int, float)) and not isinstance(safe_area.get(key), bool) and safe_area.get(key) >= 0 for key in ("x", "y", "width", "height"))
+        )
+        if not safe_valid:
+            report.error("layout_safe_area", f"{page_path}.safe_area", "Each page needs numeric safe-area insets or a measured safe-area box.")
+        elif isinstance(dimensions, dict) and all(isinstance(dimensions.get(key), (int, float)) and not isinstance(dimensions.get(key), bool) for key in ("width", "height")):
+            if all(key in safe_area for key in ("left", "top", "right", "bottom")):
+                if safe_area["left"] + safe_area["right"] >= dimensions["width"] or safe_area["top"] + safe_area["bottom"] >= dimensions["height"]:
+                    report.error("layout_safe_area", f"{page_path}.safe_area", "Safe-area insets must leave a positive usable page area.")
+            elif safe_area.get("x", 0) + safe_area.get("width", 0) > dimensions["width"] or safe_area.get("y", 0) + safe_area.get("height", 0) > dimensions["height"]:
+                report.error("layout_safe_area", f"{page_path}.safe_area", "Measured safe-area box must remain within page dimensions.")
+        boxes = page.get("element_boxes")
+        alignment = page.get("alignment_summary")
+        if boxes is not None:
+            if not isinstance(boxes, list) or not boxes:
+                report.error("layout_element_boxes", f"{page_path}.element_boxes", "element_boxes must be a non-empty list of measured boxes.")
+            else:
+                for box_index, box in enumerate(boxes):
+                    box_path = f"{page_path}.element_boxes[{box_index}]"
+                    if not isinstance(box, dict) or not _nonempty_string(box.get("element_id")):
+                        report.error("layout_element_box", box_path, "Each element box needs an element_id and numeric x/y/width/height.")
+                        continue
+                    if any(isinstance(box.get(key), bool) or not isinstance(box.get(key), (int, float)) or box.get(key) < 0 for key in ("x", "y", "width", "height")):
+                        report.error("layout_element_box", box_path, "Each element box needs non-negative numeric x/y/width/height measurements.")
+                    elif isinstance(dimensions, dict) and (
+                        box["x"] + box["width"] > dimensions.get("width", 0)
+                        or box["y"] + box["height"] > dimensions.get("height", 0)
+                    ):
+                        report.error("layout_element_box_bounds", box_path, "Measured element boxes must remain within page dimensions.")
+        elif not isinstance(alignment, dict) or not any(isinstance(alignment.get(key), (int, float)) and not isinstance(alignment.get(key), bool) for key in ("measured_grid", "max_edge_delta", "min_spacing", "max_spacing")):
+            report.error("layout_measurement_summary", page_path, "Provide measured element_boxes or a numeric alignment_summary.")
+        if page.get("overflow") not in (False, "none") or page.get("overlap") not in (False, "none"):
+            report.error("layout_blocker", page_path, "Passing layout evidence cannot report overflow or overlap.")
+        for key in ("edge_checks", "grid_checks", "spacing_checks"):
+            if not _structured_measurement_checks(page.get(key)):
+                report.error("layout_checks", f"{page_path}.{key}", "Each page needs structured passing edge, grid, and spacing measurements.")
+
+
+def _semantic_objects(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(item, dict) and _nonempty_string(item.get("object_id", item.get("id"))) and _nonempty_string(item.get("role", item.get("type")))
+        for item in value
+    )
+
+
+def _semantic_object_map(value: list[dict[str, Any]]) -> dict[str, str] | None:
+    """Return the identity/role map used to compare expected and observed objects."""
+
+    result: dict[str, str] = {}
+    for item in value:
+        object_id = item.get("object_id", item.get("id"))
+        role = item.get("role", item.get("type"))
+        if not isinstance(object_id, str) or not isinstance(role, str) or object_id in result:
+            return None
+        result[object_id] = role
+    return result
+
+
+def _validate_semantic_evidence(value: dict[str, Any], path: str, spec: dict[str, Any], render_digest: str, report: Report) -> None:
+    if value.get("render_digest") != render_digest:
+        report.error("evidence_render_binding", f"{path}.render_digest", "Semantic evidence must bind the exact render_digest used by the package.")
+    pages = value.get("pages")
+    slides = spec.get("slides") if isinstance(spec.get("slides"), list) else []
+    if not isinstance(pages, list) or len(pages) != len(slides):
+        report.error("semantic_pages", f"{path}.pages", "Semantic evidence requires one structured page record per slide.")
+        return
+    render_refs = _render_page_refs(spec)
+    semantic_refs = [page.get("page_ref") for page in pages if isinstance(page, dict)]
+    if isinstance(render_refs, list) and semantic_refs != render_refs:
+        report.error("semantic_render_page_refs", f"{path}.pages", "Semantic page_refs must exactly match the verified render page map.")
+    for index, page in enumerate(pages):
+        page_path = f"{path}.pages[{index}]"
+        if not isinstance(page, dict) or not _nonempty_string(page.get("page_ref")):
+            report.error("semantic_page_ref", page_path, "Each semantic page needs a page_ref.")
+            continue
+        expected_objects = page.get("expected_objects")
+        observed_objects = page.get("observed_objects")
+        if not _semantic_objects(expected_objects) or not _semantic_objects(observed_objects):
+            report.error("semantic_objects", page_path, "Semantic evidence must contain structured expected_objects and observed_objects; string lists are not proof.")
+        elif (
+            _semantic_object_map(expected_objects) is None
+            or _semantic_object_map(observed_objects) is None
+            or _semantic_object_map(expected_objects) != _semantic_object_map(observed_objects)
+        ):
+            report.error("semantic_object_mismatch", page_path, "Observed semantic objects must resolve to the expected object IDs and roles.")
+        count_checks = page.get("count_checks")
+        if not isinstance(count_checks, list) or not count_checks or any(
+            not isinstance(item, dict)
+            or isinstance(item.get("expected_count"), bool)
+            or not isinstance(item.get("expected_count"), int)
+            or isinstance(item.get("observed_count"), bool)
+            or not isinstance(item.get("observed_count"), int)
+            or item.get("expected_count") < 0
+            or item.get("observed_count") < 0
+            or item.get("status") not in {"pass", True}
+            for item in count_checks
+        ):
+            report.error("semantic_count_checks", f"{page_path}.count_checks", "Count evidence must record expected_count, observed_count, and a passing status.")
+        elif any(item["expected_count"] != item["observed_count"] for item in count_checks):
+            report.error("semantic_count_mismatch", f"{page_path}.count_checks", "Passing count evidence must agree on expected and observed counts.")
+        relation_checks = page.get("relation_checks", page.get("relations"))
+        if not isinstance(relation_checks, list) or not relation_checks or any(
+            not isinstance(item, dict) or not _nonempty_string(item.get("expected_relation")) or not _nonempty_string(item.get("observed_relation", item.get("relation"))) or item.get("status") not in {"pass", True}
+            for item in relation_checks
+        ):
+            report.error("semantic_relation_checks", f"{page_path}.relation_checks", "Relation evidence must record expected and observed relations with a passing status.")
+        elif any(
+            _normalize_cta(item["expected_relation"]) != _normalize_cta(item.get("observed_relation", item.get("relation")))
+            for item in relation_checks
+        ):
+            report.error("semantic_relation_mismatch", f"{page_path}.relation_checks", "Passing relation evidence must agree on expected and observed relations.")
+        copy_job = page.get("copy_image_job", page.get("copy_image_binding"))
+        if not isinstance(copy_job, dict) or not _nonempty_string(copy_job.get("expected")) or not _nonempty_string(copy_job.get("observed")) or copy_job.get("status") not in {"pass", True}:
+            report.error("semantic_copy_image_job", f"{page_path}.copy_image_job", "Copy-image evidence must record expected and observed jobs with a passing status.")
+        elif _normalize_cta(copy_job["expected"]) != _normalize_cta(copy_job["observed"]):
+            report.error("semantic_copy_image_mismatch", f"{page_path}.copy_image_job", "Passing copy-image evidence must agree on the expected and observed job.")
+        cta_target = page.get("cta_target")
+        if not isinstance(cta_target, dict) or cta_target.get("status") not in {"pass", "not_applicable"}:
+            report.error("semantic_cta_target", f"{page_path}.cta_target", "CTA evidence must be a structured target check or explicit not_applicable record.")
+        elif cta_target.get("status") == "pass" and (not _nonempty_string(cta_target.get("expected")) or not _nonempty_string(cta_target.get("observed"))):
+            report.error("semantic_cta_target", f"{page_path}.cta_target", "Passing CTA evidence needs expected and observed target values.")
+        elif cta_target.get("status") == "pass" and _normalize_cta(cta_target["expected"]) != _normalize_cta(cta_target["observed"]):
+            report.error("semantic_cta_target_mismatch", f"{page_path}.cta_target", "Passing CTA evidence must agree on the expected and observed target.")
+
+
+def _validate_similarity_evidence(value: dict[str, Any], path: str, spec: dict[str, Any], render_digest: str, report: Report, policy_context: Any = None) -> None:
+    if value.get("render_digest") != render_digest:
+        report.error("evidence_render_binding", f"{path}.render_digest", "Similarity evidence must bind the exact render_digest used by the package.")
+    if not _nonempty_string(value.get("candidate_window")) and not (isinstance(value.get("candidate_window"), list) and value.get("candidate_window")):
+        report.error("similarity_candidate_window", f"{path}.candidate_window", "Similarity evidence requires a bounded candidate window.")
+    comparator = value.get("comparator")
+    if isinstance(comparator, dict):
+        valid_comparator = _nonempty_string(comparator.get("name")) and _nonempty_string(comparator.get("version"))
+    else:
+        valid_comparator = _nonempty_string(comparator) and _nonempty_string(value.get("comparator_version"))
+    if not valid_comparator:
+        report.error("similarity_comparator", path, "Similarity evidence requires a named comparator and version.")
+    comparator_name = comparator.get("name") if isinstance(comparator, dict) else comparator
+    comparator_version = comparator.get("version") if isinstance(comparator, dict) else value.get("comparator_version")
+    trusted = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+    comparators = trusted.get("comparators") if isinstance(trusted, Mapping) else None
+    registered = comparators.get(str(comparator_name)) if isinstance(comparators, Mapping) else None
+    if not isinstance(registered, Mapping) or registered.get("version") != comparator_version:
+        report.error("similarity_comparator_unregistered", f"{path}.comparator", "Similarity comparator ID/version must be registered and pinned by trusted policy.")
+    def valid_fingerprint(candidate: Any) -> bool:
+        return isinstance(candidate, dict) and bool(candidate) and (
+            _nonempty_string(candidate.get("fingerprint_id"))
+            or _nonempty_string(candidate.get("hash"))
+            or all(_nonempty_string(candidate.get(key)) for key in ("layout_family", "focal_object", "motif_family", "composition_axis", "text_density"))
+        )
+
+    if not valid_fingerprint(value.get("current_fingerprint")):
+        report.error("similarity_current_fingerprint", f"{path}.current_fingerprint", "Similarity evidence requires the current visual fingerprint.")
+    if not valid_fingerprint(value.get("candidate_fingerprint")):
+        report.error("similarity_candidate_fingerprint", f"{path}.candidate_fingerprint", "Similarity evidence requires the candidate visual fingerprint.")
+    threshold = value.get("threshold")
+    score = value.get("score", value.get("similarity"))
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+        checks = value.get("similarity_checks")
+        if isinstance(checks, list) and len(checks) == 1 and isinstance(checks[0], dict):
+            score = checks[0].get("score", checks[0].get("similarity"))
+            threshold = checks[0].get("threshold", threshold)
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 <= threshold <= 1:
+        report.error("similarity_threshold", f"{path}.threshold", "Similarity evidence requires a numeric 0–1 threshold.")
+    if isinstance(score, (int, float)) and not isinstance(score, bool) and isinstance(threshold, (int, float)) and not isinstance(threshold, bool) and score > threshold:
+        report.error("similarity_threshold_exceeded", path, "Actual similarity score exceeds the declared threshold.")
+
+
+def _validate_evidence_authority(
+    value: dict[str, Any],
+    key: str,
+    path: str,
+    render_digest: str | None,
+    policy_context: Any,
+    report: Report,
+) -> None:
+    """Require production evidence to name an externally pinned tool receipt."""
+
+    trusted = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+    registered = trusted.get("evidence_tools") if isinstance(trusted, Mapping) else None
+    expected = registered.get(key) if isinstance(registered, Mapping) else None
+    if not isinstance(expected, Mapping):
+        report.error("evidence_authority_missing", path, "Production evidence requires a tool/receipt mapping in the separately verified policy.")
+        return
+    for field in ("tool_id", "receipt_id", "receipt_digest"):
+        if not _nonempty_string(value.get(field)):
+            report.error("evidence_authority", f"{path}.{field}", "Production evidence requires a tool ID, receipt ID, and receipt digest.")
+        elif value.get(field) != expected.get(field):
+            report.error("evidence_authority", f"{path}.{field}", "Evidence tool/receipt fields must exactly match the trusted policy pin.")
+    if render_digest is not None and expected.get("render_digest") != render_digest:
+        report.error("evidence_authority_render", f"{path}.render_digest", "Evidence tool receipt must bind the verified render digest.")
+
+
+def _validate_external_result_receipt(
+    value: Mapping[str, Any],
+    key: str,
+    path: str,
+    spec: Mapping[str, Any],
+    render_digest: str | None,
+    expected_scope: dict[str, str] | None,
+    policy_context: Any,
+    report: Report,
+) -> None:
+    """Bind a passing measurement to an immutable externally computed result.
+
+    A registered tool/comparator is only capability metadata.  The result
+    itself must be loaded in the trusted policy, digest-checked, and matched
+    field-for-field against the content evidence.
+    """
+
+    trusted = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+    results = trusted.get("evidence_results") if isinstance(trusted, Mapping) else None
+    expected = results.get(key) if isinstance(results, Mapping) else None
+    if not isinstance(expected, Mapping):
+        report.error("evidence_result_authority_missing", path, "Passing production evidence requires an externally loaded, policy-pinned result receipt.")
+        return
+    result_id = value.get("result_id")
+    result_digest = value.get("result_digest")
+    if not _nonempty_string(result_id) or result_id != expected.get("result_id"):
+        report.error("evidence_result_id", f"{path}.result_id", "Evidence must reference the exact trusted result receipt ID.")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(result_digest)) or result_digest != expected.get("result_digest"):
+        report.error("evidence_result_digest", f"{path}.result_digest", "Evidence must reference the exact trusted result receipt digest.")
+    payload_digest = value.get("payload_digest")
+    expected_payload_digest = expected.get("payload_digest")
+    payload = {
+        field: item for field, item in value.items()
+        if field not in {"result_id", "result_digest", "payload_digest"}
+    }
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload_digest)) or payload_digest != expected_payload_digest or _canonical_json_digest(payload) != expected_payload_digest:
+        report.error("evidence_result_payload", f"{path}.payload_digest", "Evidence payload must exactly match the externally loaded result receipt.")
+    unsigned = {key_name: item for key_name, item in expected.items() if key_name != "result_digest"}
+    expected_digest = _canonical_json_digest(unsigned)
+    if expected_digest is None or expected.get("result_digest") != expected_digest:
+        report.error("evidence_result_digest", f"{path}.result_digest", "Trusted result receipt digest does not match its immutable canonical contents.")
+    required_fields = ("content_id", "render_digest", "page_refs", "scope", "timestamp", "observations", "fingerprints", "payload_digest")
+    for field in required_fields:
+        if field not in expected:
+            report.error("evidence_result_shape", f"{path}.{field}", "Trusted result receipts require content, render, page, scope, timestamp, and observation bindings.")
+    if expected.get("content_id") != spec.get("content_id"):
+        report.error("evidence_result_content", f"{path}.content_id", "Result receipt must bind the current content_id.")
+    if render_digest is not None and expected.get("render_digest") != render_digest:
+        report.error("evidence_result_render", f"{path}.render_digest", "Result receipt must bind the exact render_digest.")
+    page_refs = value.get("page_refs")
+    verified_refs = _render_page_refs(spec)
+    if not isinstance(page_refs, list) or page_refs != expected.get("page_refs") or (isinstance(verified_refs, list) and page_refs != verified_refs):
+        report.error("evidence_result_pages", f"{path}.page_refs", "Result receipt page_refs must exactly match the verified render page map.")
+    if expected.get("scope") != _scope_with_brand(expected_scope):
+        report.error("evidence_result_scope", f"{path}.scope", "Result receipt scope must exactly match the content scope.")
+    result_timestamp = _parse_datetime(expected.get("timestamp"))
+    if result_timestamp is None:
+        report.error("evidence_result_timestamp", f"{path}.timestamp", "Result receipt requires a timezone-aware timestamp.")
+    elif _timestamp_is_future(result_timestamp):
+        report.error("evidence_result_timestamp_future", f"{path}.timestamp", "Result receipt timestamp cannot be in the future beyond the allowed clock skew.")
+    reference_times: list[tuple[str, datetime]] = []
+    design = spec.get("design") if isinstance(spec, Mapping) else None
+    render_evidence = design.get("render_evidence") if isinstance(design, Mapping) else None
+    render_time = _parse_datetime(render_evidence.get("captured_at", render_evidence.get("verified_at"))) if isinstance(render_evidence, Mapping) else None
+    if render_time is not None:
+        reference_times.append(("render", render_time))
+    selection = spec.get("human_selected_route") if isinstance(spec, Mapping) else None
+    selection_time = _parse_datetime(selection.get("selected_at", selection.get("timestamp"))) if isinstance(selection, Mapping) else None
+    if selection_time is not None:
+        reference_times.append(("selection", selection_time))
+    trusted_actions = trusted.get("action_records") if isinstance(trusted, Mapping) else None
+    if isinstance(trusted_actions, Mapping):
+        for action_name, action_record in trusted_actions.items():
+            if isinstance(action_record, Mapping):
+                action_time = _parse_datetime(action_record.get("recorded_at"))
+                if action_time is not None:
+                    reference_times.append((f"action:{action_name}", action_time))
+    if result_timestamp is not None:
+        for label, reference_time in reference_times:
+            if result_timestamp < reference_time:
+                report.error("evidence_result_timestamp_order", f"{path}.timestamp", f"Result receipt timestamp must not precede the verified {label} receipt.")
+    observations = expected.get("observations")
+    if not isinstance(observations, list) or not observations or any(not isinstance(item, (str, Mapping)) for item in observations):
+        report.error("evidence_result_observations", f"{path}.observations", "Result receipt observations must be a non-empty structured list.")
+    fingerprints = expected.get("fingerprints")
+    if not isinstance(fingerprints, (list, Mapping)) or not fingerprints:
+        report.error("evidence_result_fingerprints", f"{path}.fingerprints", "Result receipt fingerprints must be a non-empty page-bound structure.")
+    audit = spec.get("anti_slop_audit") if isinstance(spec, Mapping) else None
+    declared_fingerprints = audit.get("visual_fingerprints") if isinstance(audit, Mapping) else None
+    if isinstance(declared_fingerprints, list) and declared_fingerprints:
+        expected_fingerprints = [
+            {"page_ref": item.get("page_ref"), "page_digest": item.get("page_digest")}
+            for item in declared_fingerprints if isinstance(item, Mapping)
+        ]
+        if _json_plain(fingerprints) != expected_fingerprints:
+            report.error("evidence_result_fingerprints", f"{path}.fingerprints", "Result receipt fingerprints must exactly match the verified page fingerprint map.")
+    if key in {"ocr", "layout", "semantic"}:
+        if not _nonempty_string(expected.get("tool_id")) or not _nonempty_string(expected.get("tool_version")):
+            report.error("evidence_result_tool", f"{path}.tool_id", "Result receipt must bind a registered tool ID and version.")
+    if key == "recent_similarity":
+        if not isinstance(expected.get("comparator"), Mapping) or not _nonempty_string(expected.get("comparator", {}).get("name")) or not _nonempty_string(expected.get("comparator", {}).get("version")):
+            report.error("evidence_result_comparator", f"{path}.comparator", "Similarity result receipt must bind comparator ID and version.")
+        for field in ("score", "threshold", "current_fingerprint", "candidate_fingerprint"):
+            if field not in expected:
+                report.error("evidence_result_shape", f"{path}.{field}", "Similarity result receipts require exact score, threshold, and current/candidate fingerprints.")
+
+    # Content evidence may not replace a trusted score, comparator, verdict,
+    # fingerprint, or observation with an attacker-controlled value.
+    exact_fields = (
+        "content_id", "render_digest", "page_refs", "scope", "timestamp", "observations", "payload_digest",
+        "tool_id", "tool_version", "receipt_id", "receipt_digest", "comparator",
+        "comparator_version", "candidate_window", "current_fingerprint", "candidate_fingerprint",
+        "score", "threshold", "verdict", "status", "pairwise_verdict", "reference_set_id", "version",
+    )
+    for field in exact_fields:
+        value_field = value.get(field)
+        if field == "timestamp" and field not in value:
+            value_field = value.get("checked_at")
+        # A receipt reference is the authority for fields omitted from the
+        # content record; when a field is duplicated, it must agree exactly.
+        if field in expected and (field in value or field in {"timestamp", "render_digest", "page_refs"}) and value_field != expected.get(field):
+            report.error("evidence_result_binding", f"{path}.{field}", "Evidence fields must exactly match the trusted external result receipt.")
+
+
+def _validate_approved_exception(
+    value: Any,
+    path: str,
+    expected_scope: dict[str, str] | None,
+    render_digest: str | None,
+    policy_context: Any,
+    report: Report,
+    *,
+    expected_affected: dict[str, Any] | None = None,
+    excluded_ids: Iterable[str] = (),
+    render_captured_at: Any = None,
+    selection_at: Any = None,
+) -> bool:
+    """Require exceptions to be externally authorized and artifact-bound."""
+
+    if not isinstance(value, dict):
+        report.error("approved_exception_type", path, "Approved exceptions must be structured objects.")
+        return False
+    valid = True
+    if value.get("approved") is not True:
+        report.error("approved_exception_status", f"{path}.approved", "An exception must explicitly be approved.")
+        valid = False
+    if not _nonempty_string(value.get("reason")):
+        report.error("approved_exception_reason", f"{path}.reason", "Approved exceptions require a concrete reason.")
+        valid = False
+    approved_at = _parse_datetime(value.get("approved_at"))
+    if approved_at is None:
+        report.error("approved_exception_timestamp", f"{path}.approved_at", "Approved exceptions require a timezone-aware approval timestamp.")
+        valid = False
+    else:
+        now = datetime.now(timezone.utc)
+        if approved_at > now:
+            report.error("approved_exception_timestamp_future", f"{path}.approved_at", "Exception approval timestamp cannot be in the future.")
+            valid = False
+        for label, raw_timestamp in (("render", render_captured_at), ("selection", selection_at)):
+            reference = _parse_datetime(raw_timestamp)
+            if reference is not None and approved_at < reference:
+                report.error("approved_exception_timestamp_order", f"{path}.approved_at", f"Exception approval must not precede the verified {label} receipt.")
+                valid = False
+    if not _nonempty_string(value.get("approved_by")) or value.get("approved_role") not in {"reviewer", "lead"}:
+        report.error("approved_exception_reviewer", path, "Approved exceptions require a mapped reviewer/lead identity and role.")
+        valid = False
+    if value.get("scope") != _scope_with_brand(expected_scope):
+        report.error("approved_exception_scope", f"{path}.scope", "Approved exception scope must exactly match the content isolation scope.")
+        valid = False
+    if render_digest is None or value.get("render_digest") != render_digest:
+        report.error("approved_exception_render", f"{path}.render_digest", "Approved exception must bind the verified render_digest.")
+        valid = False
+    affected = value.get("affected")
+    if not isinstance(affected, dict) or not any(
+        (isinstance(affected.get(key), list) and bool(affected.get(key)))
+        or _nonempty_string(affected.get(key))
+        or (isinstance(affected.get(key), dict) and bool(affected.get(key)))
+        for key in ("page_refs", "asset_id", "fingerprint")
+    ):
+        report.error("approved_exception_affected", f"{path}.affected", "Approved exceptions must identify affected page refs, asset ID, or fingerprint.")
+        valid = False
+    if isinstance(expected_affected, dict) and isinstance(affected, dict):
+        for key, expected_value in expected_affected.items():
+            if affected.get(key) != expected_value:
+                report.error("approved_exception_target", f"{path}.affected.{key}", "Approved exception affected target must exactly match the repeated composition, asset, or fingerprint being excepted.")
+                valid = False
+    trusted_data = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+    role_mapping = trusted_data.get("role_mapping") if isinstance(trusted_data, Mapping) else None
+    mapped = (
+        isinstance(role_mapping, Mapping)
+        and value.get("approved_role") in {"reviewer", "lead"}
+        and isinstance(role_mapping.get(value.get("approved_role")), list)
+        and value.get("approved_by") in role_mapping.get(value.get("approved_role"), [])
+    )
+    if not mapped:
+        report.error("approved_exception_reviewer_trust", f"{path}.approved_by", "Exception approver must be mapped by the separately loaded trusted policy; embedded identities cannot authorize exceptions.")
+        valid = False
+    self_approval = isinstance(trusted_data, Mapping) and isinstance(trusted_data.get("exception_policy"), Mapping) and trusted_data["exception_policy"].get("self_approval") is True and trusted_data["exception_policy"].get("scope") == _scope_with_brand(expected_scope) and trusted_data["exception_policy"].get("render_digest") == render_digest
+    if isinstance(trusted_data, Mapping) and value.get("approved_by") == trusted_data.get("actor_id") and not self_approval:
+        report.error("approved_exception_self_approval", f"{path}.approved_by", "Exception approver must be distinct from the current authenticated actor unless trusted policy explicitly authorizes self-approval for this exact scope and render.")
+        valid = False
+    allow_single = isinstance(trusted_data, Mapping) and trusted_data.get("allow_single_person_exception") is True and self_approval
+    if not allow_single:
+        if _nonempty_string(value.get("approved_by")) and value.get("approved_by") in set(excluded_ids):
+            report.error("approved_exception_not_distinct", f"{path}.approved_by", "Exception approver must be distinct from the generator, selector, and independent reviewer unless trusted policy explicitly allows a single-person exception.")
+            valid = False
+    return valid
+
+
+def _validate_visual_fingerprints(
+    spec: dict[str, Any],
+    audit: dict[str, Any],
+    state: Any,
+    render_digest: str | None,
+    report: Report,
+    *,
+    expected_scope: dict[str, str] | None = None,
+    policy_context: Any = None,
+    render_pages: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    if not _anti_slop_final_required(spec, state):
+        return
+    raw = audit.get("visual_fingerprints", audit.get("slide_fingerprints", audit.get("fingerprints")))
+    if raw is None:
+        design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+        raw = design.get("visual_fingerprints")
+    path = "$.anti_slop_audit.visual_fingerprints"
+    if not isinstance(raw, list):
+        report.error("visual_fingerprints_missing", path, "Final content requires one structured visual fingerprint and asset manifest per slide.")
+        return
+    slides = spec.get("slides") if isinstance(spec.get("slides"), list) else []
+    if len(raw) != len(slides):
+        report.error("visual_fingerprints_pages", path, "Visual fingerprints must contain exactly one record per slide.")
+    digest = audit.get("visual_fingerprint_render_digest", audit.get("fingerprint_render_digest"))
+    if digest != render_digest:
+        report.error("visual_fingerprint_render_binding", f"{path}.render_digest", "Visual fingerprints must bind the exact render_digest used by the package.")
+    compositions: dict[tuple[str, str, str, str, str], list[int]] = {}
+    asset_counts: dict[str, int] = {}
+    asset_policies: dict[str, dict[str, Any]] = {}
+    asset_canonical: dict[str, str] = {}
+    render_refs = _render_page_refs(spec)
+    render_pages = render_pages or {}
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    selection = spec.get("human_selected_route") if isinstance(spec.get("human_selected_route"), dict) else {}
+    critique = audit.get("independent_critique") if isinstance(audit.get("independent_critique"), dict) else {}
+    render_evidence = design.get("render_evidence") if isinstance(design.get("render_evidence"), dict) else {}
+    render_captured_at = render_evidence.get("captured_at", render_evidence.get("verified_at"))
+    selection_at = selection.get("selected_at", selection.get("timestamp"))
+    excluded_exception_ids = tuple(
+        value for value in (selection.get("selected_by"), design.get("generated_by", design.get("created_by")), critique.get("reviewer_id"))
+        if _nonempty_string(value)
+    )
+    if isinstance(render_refs, list) and len(render_refs) == len(slides):
+        fingerprint_refs = [item.get("page_ref") for item in raw if isinstance(item, dict)]
+        if fingerprint_refs != render_refs:
+            report.error("visual_fingerprint_page_refs", path, "Visual fingerprint page_refs must match the verified render page_refs in order.")
+        if any(not _nonempty_string(ref) for ref in fingerprint_refs):
+            report.error("visual_fingerprint_page_refs_type", path, "Visual fingerprint page_refs must be non-empty strings.")
+        elif len(fingerprint_refs) != len(set(fingerprint_refs)):
+            report.error("visual_fingerprint_page_refs_unique", path, "Visual fingerprint page_refs must be unique.")
+    for index, item in enumerate(raw):
+        item_path = f"{path}[{index}]"
+        if not isinstance(item, dict):
+            report.error("visual_fingerprint_type", item_path, "Each visual fingerprint must be an object.")
+            continue
+        if not _nonempty_string(item.get("page_ref")):
+            report.error("visual_fingerprint_page_ref", f"{item_path}.page_ref", "Each visual fingerprint needs a page_ref.")
+        page_ref = item.get("page_ref")
+        snapshot = render_pages.get(page_ref) if _nonempty_string(page_ref) else None
+        page_digest = item.get("page_digest")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(page_digest)):
+            report.error("visual_fingerprint_page_digest", f"{item_path}.page_digest", "Each final visual fingerprint must declare the SHA-256 digest of decoded page pixels.")
+        elif snapshot is None or page_digest != snapshot.get("page_digest"):
+            report.error("visual_fingerprint_page_digest", f"{item_path}.page_digest", "Visual fingerprint page_digest must exactly match decoded pixels from the verified render page.")
+        coarse_hash = item.get("coarse_hash")
+        if coarse_hash is not None and (not isinstance(coarse_hash, str) or coarse_hash != (snapshot or {}).get("coarse_hash")):
+            report.error("visual_fingerprint_coarse_hash", f"{item_path}.coarse_hash", "Optional coarse visual fingerprint must match the decoded page pixels.")
+        required_fields = ("layout_family", "focal_object", "motif_family", "composition_axis", "text_density")
+        if any(not _nonempty_string(item.get(key)) for key in required_fields):
+            report.error("visual_fingerprint_fields", item_path, "Each fingerprint needs layout family, focal object, motif family, composition axis, and text density.")
+        else:
+            composition = tuple(str(item[key]).casefold().strip() for key in required_fields)
+            compositions.setdefault(composition, []).append(index + 1)
+        assets = item.get("assets", item.get("asset_manifest"))
+        if not isinstance(assets, list):
+            report.error("asset_manifest", f"{item_path}.assets", "Each slide needs a structured asset manifest, including an explicit empty list when no asset is used.")
+            continue
+        for asset_index, asset in enumerate(assets):
+            asset_path = f"{item_path}.assets[{asset_index}]"
+            if not isinstance(asset, dict) or not _nonempty_string(asset.get("asset_id")) or not _nonempty_string(asset.get("role")):
+                report.error("asset_manifest_entry", asset_path, "Each asset needs asset_id and role.")
+                continue
+            provenance = asset.get("provenance")
+            if not isinstance(provenance, dict) or not any(_nonempty_string(provenance.get(key)) for key in ("source_id", "source_ref", "kind", "uri")):
+                report.error("asset_provenance", f"{asset_path}.provenance", "Each asset needs structured provenance; a free-form asset label is not proof.")
+            reuse = asset.get("reuse_policy")
+            if not isinstance(reuse, dict):
+                report.error("asset_reuse_policy", f"{asset_path}.reuse_policy", "Each asset needs a bounded reuse_policy.")
+                continue
+            max_uses = reuse.get("max_uses")
+            identity = reuse.get("identity") is True or str(asset.get("role", "")).casefold() in {"identity", "branding", "logo"}
+            if not identity and (isinstance(max_uses, bool) or not isinstance(max_uses, int) or max_uses < 1):
+                report.error("asset_reuse_policy", f"{asset_path}.reuse_policy.max_uses", "Non-identity assets need a positive max_uses bound.")
+            asset_id = asset["asset_id"]
+            canonical_occurrence = json.dumps(
+                {"role": asset.get("role"), "provenance": provenance, "reuse_policy": reuse},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if asset_id in asset_canonical and asset_canonical[asset_id] != canonical_occurrence:
+                report.error(
+                    "asset_manifest_inconsistent",
+                    asset_path,
+                    "Every occurrence of an asset_id must use the same role, provenance, identity, reuse bound, and exception policy.",
+                )
+            else:
+                asset_canonical[asset_id] = canonical_occurrence
+            asset_counts[asset_id] = asset_counts.get(asset_id, 0) + 1
+            asset_policies.setdefault(asset_id, {"max_uses": max_uses, "identity": identity, "exception": reuse.get("approved_exception")})
+    for composition, pages in compositions.items():
+        if len(pages) > 1:
+            exception = audit.get("approved_exceptions", {}).get("repeated_composition") if isinstance(audit.get("approved_exceptions"), dict) else None
+            if not _validate_approved_exception(
+                exception,
+                f"{path}.approved_exceptions.repeated_composition",
+                expected_scope,
+                render_digest,
+                policy_context,
+                report,
+                expected_affected={
+                    "page_refs": [
+                        render_refs[page_number - 1]
+                        for page_number in pages
+                        if isinstance(render_refs, list) and 0 < page_number <= len(render_refs)
+                    ]
+                    if isinstance(render_refs, list)
+                    else None,
+                },
+                excluded_ids=excluded_exception_ids,
+                render_captured_at=render_captured_at,
+                selection_at=selection_at,
+            ):
+                report.error("repeated_full_composition", path, f"Full visual composition repeats on slides {pages}; record a structured approved exception if intentional.")
+    pixel_pages: dict[str, list[str]] = {}
+    for page_ref, snapshot in render_pages.items():
+        digest = snapshot.get("page_digest")
+        if isinstance(digest, str):
+            pixel_pages.setdefault(digest, []).append(page_ref)
+    for digest, pages in pixel_pages.items():
+        if len(pages) <= 1:
+            continue
+        exceptions = audit.get("approved_exceptions") if isinstance(audit.get("approved_exceptions"), dict) else {}
+        exception = exceptions.get("identity_only_pixels") if isinstance(exceptions, dict) else None
+        identity_only = isinstance(exception, dict) and exception.get("identity_only") is True
+        if not identity_only or not _validate_approved_exception(
+            exception,
+            f"{path}.approved_exceptions.identity_only_pixels",
+            expected_scope,
+            render_digest,
+            policy_context,
+            report,
+            expected_affected={"page_refs": pages},
+            excluded_ids=excluded_exception_ids,
+            render_captured_at=render_captured_at,
+            selection_at=selection_at,
+        ):
+            report.error("repeated_identical_pixels", path, f"Decoded page pixels repeat on {pages}; metadata cannot certify visual uniqueness. Use an identity-only approved exception when repetition is intentional.")
+    coarse_pages: dict[str, list[str]] = {}
+    for page_ref, snapshot in render_pages.items():
+        coarse = snapshot.get("coarse_hash")
+        if isinstance(coarse, str):
+            coarse_pages.setdefault(coarse, []).append(page_ref)
+    for coarse, pages in coarse_pages.items():
+        if len(pages) <= 1 or len({render_pages[page].get("page_digest") for page in pages}) <= 1:
+            continue
+        exception = (audit.get("approved_exceptions") or {}).get("near_identical_pixels") if isinstance(audit.get("approved_exceptions"), dict) else None
+        if not _validate_approved_exception(
+            exception,
+            f"{path}.approved_exceptions.near_identical_pixels",
+            expected_scope,
+            render_digest,
+            policy_context,
+            report,
+            expected_affected={"page_refs": pages},
+            excluded_ids=excluded_exception_ids,
+            render_captured_at=render_captured_at,
+            selection_at=selection_at,
+        ):
+            report.error("near_identical_pixels", path, f"Decoded pages share the same conservative coarse visual fingerprint on {pages}; obtain review or an approved exception for intentional near repetition.")
+    for asset_id, count in asset_counts.items():
+        policy = asset_policies.get(asset_id, {})
+        if policy.get("identity") is True:
+            continue
+        max_uses = policy.get("max_uses")
+        if isinstance(max_uses, int) and count > max_uses:
+            exception = policy.get("exception")
+            if not _validate_approved_exception(
+                exception,
+                f"{path}.asset_manifest.{asset_id}.reuse_policy.approved_exception",
+                expected_scope,
+                render_digest,
+                policy_context,
+                report,
+                expected_affected={"asset_id": asset_id},
+                excluded_ids=excluded_exception_ids,
+                render_captured_at=render_captured_at,
+                selection_at=selection_at,
+            ):
+                report.error("asset_reuse_exceeded", path, f"Non-identity asset {asset_id!r} is reused {count} times beyond max_uses={max_uses} without an approved exception.")
+
+
+def _trusted_identity_mapped(identity: Any, policy_context: Any) -> bool:
+    if not _nonempty_string(identity) or not isinstance(policy_context, TrustedPolicyContext):
+        return False
+    data = policy_context.data
+    mapping = data.get("role_mapping") if isinstance(data, Mapping) else None
+    return isinstance(mapping, Mapping) and any(
+        isinstance(members, list) and identity in members
+        for members in mapping.values()
+    )
+
+
+def _validate_action_receipts(
+    spec: dict[str, Any],
+    state: Any,
+    expected_scope: dict[str, str] | None,
+    policy_context: Any,
+    report: Report,
+) -> None:
+    """Bind route selection and generation to externally pinned action records.
+
+    Membership in a role mapping only proves that an identity could act; it
+    does not prove that the action happened.  Final authorization therefore
+    requires receipt IDs/digests in the record to match immutable, separately
+    loaded policy action records.
+    """
+
+    if not _anti_slop_final_required(spec, state):
+        return
+    path = "$.policy.action_records"
+    trusted = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+    records = trusted.get("action_records") if isinstance(trusted, Mapping) else None
+    if not isinstance(records, Mapping):
+        report.error("action_receipt_unverified", path, "Final content requires externally policy-pinned selection and generation action receipts.")
+        return
+    selector = spec.get("human_selected_route") if isinstance(spec.get("human_selected_route"), dict) else {}
+    design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+    route_set = spec.get("route_set") if isinstance(spec.get("route_set"), dict) else {}
+    route_id = selector.get("route_id")
+    selected_route = next(
+        (route for route in route_set.get("routes", ()) if isinstance(route, Mapping) and route.get("route_id") == route_id),
+        None,
+    )
+    route_payload_digest = _canonical_json_digest(selected_route) if selected_route is not None else None
+    render_digest = (design.get("render_evidence") or {}).get("render_digest") if isinstance(design.get("render_evidence"), dict) else None
+    package_digest = design.get("export_checksum")
+    content_id = spec.get("content_id")
+    publishing = spec.get("publishing") if isinstance(spec.get("publishing"), dict) else {}
+    # Publishing validation defines target_account as the effective account;
+    # legacy aliases are deliberately ignored so a receipt cannot bind a
+    # different, shadow target field.
+    target_account = publishing.get("target_account")
+    target_id = target_account if _nonempty_string(target_account) else None
+    if target_account is not None and target_id is None:
+        report.error("action_receipt_target", "$.publishing.target_account", "Action receipts require a scalar effective publishing.target_account.")
+    if _state_at_least(state, "SCHEDULED") and target_id is None:
+        report.error("action_receipt_target", "$.publishing.target_account", "Scheduled/published actions require a non-empty effective publishing.target_account.")
+    design_id = design.get("canva_design_id")
+    expected = (
+        ("route_selection", selector.get("selected_by"), selector.get("selection_receipt_id"), selector.get("selection_receipt_digest"), route_id, route_payload_digest, target_id, None),
+        ("generation", design.get("generated_by", design.get("created_by")), design.get("generation_receipt_id"), design.get("generation_receipt_digest"), route_id, route_payload_digest, target_id, design_id),
+    )
+    for record_name, actor, receipt_id, receipt_digest, expected_route_id, expected_route_digest, expected_target_id, expected_design_id in expected:
+        item_path = f"{path}.{record_name}"
+        receipt = records.get(record_name)
+        valid = isinstance(receipt, Mapping)
+        if not valid:
+            report.error("action_receipt_unverified", item_path, "Externally pinned action record is missing.")
+            continue
+        if not _nonempty_string(receipt_id) or receipt.get("receipt_id") != receipt_id:
+            report.error("action_receipt_id", item_path, "Action receipt ID must match the externally pinned record.")
+            valid = False
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt_digest)) or receipt.get("receipt_digest") != receipt_digest:
+            report.error("action_receipt_digest", item_path, "Action receipt digest must match the externally pinned SHA-256 receipt.")
+            valid = False
+        if not _nonempty_string(actor) or receipt.get("actor_id") != actor:
+            report.error("action_receipt_actor", item_path, "Action receipt actor must exactly match the recorded selector/generator identity.")
+            valid = False
+        if receipt.get("action_kind") != record_name or receipt.get("content_id") != content_id:
+            report.error("action_receipt_binding", item_path, "Action receipt must bind the current content_id and exact action kind; receipts cannot be reused across records.")
+            valid = False
+        if receipt.get("route_id") != expected_route_id or receipt.get("route_payload_digest") != expected_route_digest:
+            report.error("action_receipt_route", item_path, "Action receipt must bind the selected route ID and canonical route payload digest.")
+            valid = False
+        if receipt.get("target_id") != expected_target_id:
+            report.error("action_receipt_target", item_path, "Action receipt target binding must match the current content target.")
+            valid = False
+        if record_name == "generation" and receipt.get("design_id") != expected_design_id:
+            report.error("action_receipt_design", item_path, "Generation receipt must bind the current design ID when one exists.")
+            valid = False
+        if receipt.get("render_digest") != render_digest or receipt.get("package_digest") != package_digest:
+            report.error("action_receipt_artifact", item_path, "Action receipt must bind the current render and export/package digest.")
+            valid = False
+        if receipt.get("scope") != _scope_with_brand(expected_scope):
+            report.error("action_receipt_scope", item_path, "Action receipt scope must exactly match the content isolation scope.")
+            valid = False
+        if receipt.get("status") not in {"recorded", "verified", "committed"}:
+            report.error("action_receipt_status", item_path, "Action receipt must be a recorded/verified external action.")
+            valid = False
+        recorded_at = _parse_datetime(receipt.get("recorded_at"))
+        if not _nonempty_string(receipt.get("recorded_at")) or recorded_at is None:
+            report.error("action_receipt_timestamp", item_path, "Action receipt requires a timezone-aware recorded_at timestamp.")
+            valid = False
+        elif _timestamp_is_future(recorded_at):
+            report.error("action_receipt_timestamp", item_path, "Action receipt recorded_at cannot be in the future beyond the allowed clock skew.")
+            valid = False
+        if not valid:
+            continue
+
+
+def _validate_benchmark_registry(
+    benchmark: dict[str, Any],
+    expected_scope: dict[str, str] | None,
+    reviewer_id: Any,
+    policy_context: Any,
+    registry_context: Any,
+    path: str,
+    report: Report,
+    *,
+    render_digest: str | None = None,
+    candidate_ids: Iterable[str] = (),
+) -> bool:
+    """Validate benchmark authority loaded outside the mutable content record."""
+
+    if not isinstance(registry_context, BenchmarkRegistryContext):
+        report.error("benchmark_registry_required", path, "A passing production benchmark requires an independently loaded benchmark registry.")
+        return False
+    data = registry_context.data
+    valid = True
+    if not isinstance(data, Mapping):
+        report.error("benchmark_registry_type", path, "Benchmark registry must be an object loaded from an external authority.")
+        return False
+    if data.get("source") != TRUSTED_BENCHMARK_SOURCE:
+        report.error("benchmark_registry_source", f"{path}.source", "Benchmark registry source must be local_authenticated_benchmark_registry.")
+        valid = False
+    if data.get("schema_version") != "1.0":
+        report.error("benchmark_registry_schema", f"{path}.schema_version", "Benchmark registry schema_version must be 1.0.")
+        valid = False
+    for key in ("registry_id", "revision"):
+        if not _nonempty_string(data.get(key)):
+            report.error("benchmark_registry_metadata", f"{path}.{key}", "Benchmark registry requires a stable registry_id and revision.")
+            valid = False
+    if data.get("scope") != _scope_with_brand(expected_scope):
+        report.error("benchmark_registry_scope", f"{path}.scope", "Benchmark registry scope must exactly match the content isolation scope.")
+        valid = False
+    if benchmark.get("registry_checksum") != registry_context.canonical_digest:
+        report.error("benchmark_registry_receipt", f"{path}.registry_checksum", "Benchmark must bind the canonical digest of the independently loaded registry.")
+        valid = False
+    policy_pin = policy_context.data.get("benchmark_registry") if isinstance(policy_context, TrustedPolicyContext) and isinstance(policy_context.data, Mapping) else None
+    if not isinstance(policy_pin, Mapping):
+        report.error("benchmark_registry_policy_pin", path, "A benchmark registry cannot authorize production unless its ID, revision, digest, and corpus are pinned by the separately loaded trusted policy.")
+        valid = False
+    else:
+        if policy_pin.get("source") != TRUSTED_BENCHMARK_SOURCE:
+            report.error("benchmark_registry_policy_pin", f"{path}.source", "Trusted policy must identify the authenticated benchmark registry source.")
+            valid = False
+        for key, expected in (("registry_id", data.get("registry_id")), ("revision", data.get("revision")), ("registry_checksum", registry_context.canonical_digest)):
+            if policy_pin.get(key) != expected:
+                report.error("benchmark_registry_policy_pin", f"{path}.{key}", "Trusted policy must pin the exact loaded benchmark registry ID, revision, and file digest.")
+                valid = False
+    reference_sets = data.get("reference_sets")
+    if not isinstance(reference_sets, (list, tuple)):
+        report.error("benchmark_registry_sets", f"{path}.reference_sets", "Benchmark registry reference_sets must be a list.")
+        return False
+    reference_id = benchmark.get("reference_set_id")
+    reference_version = benchmark.get("version")
+    matches = [
+        entry for entry in reference_sets
+        if isinstance(entry, Mapping)
+        and entry.get("reference_set_id") == reference_id
+        and entry.get("version") == reference_version
+    ]
+    if len(matches) != 1:
+        report.error("benchmark_registry_reference_set", f"{path}.reference_set_id", "Benchmark reference_set_id/version must resolve to exactly one external registry entry.")
+        return False
+    entry = matches[0]
+    if entry.get("status") != "approved":
+        report.error("benchmark_registry_status", f"{path}.reference_set_id", "Benchmark reference set must be approved by the external registry.")
+        valid = False
+    comparator = benchmark.get("comparator")
+    trusted_comparators = policy_context.data.get("comparators") if isinstance(policy_context, TrustedPolicyContext) and isinstance(policy_context.data, Mapping) else None
+    if not isinstance(comparator, Mapping) or not _nonempty_string(comparator.get("id")) or not _nonempty_string(comparator.get("version")):
+        report.error("benchmark_registry_comparator", f"{path}.comparator", "Benchmark pass requires a registered comparator ID and version.")
+        valid = False
+    elif not isinstance(trusted_comparators, Mapping) or not isinstance(trusted_comparators.get(comparator.get("id")), Mapping) or trusted_comparators.get(comparator.get("id")).get("version") != comparator.get("version"):
+        report.error("benchmark_registry_comparator", f"{path}.comparator", "Benchmark comparator ID/version must be pinned by trusted policy.")
+        valid = False
+    if entry.get("scope") != _scope_with_brand(expected_scope):
+        report.error("benchmark_registry_entry_scope", f"{path}.reference_set_id", "Benchmark reference set scope must exactly match the content scope.")
+        valid = False
+    entry_checksum = entry.get("checksum")
+    unsigned_entry = {key: _json_plain(value) for key, value in entry.items() if key != "checksum"}
+    expected_checksum = "sha256:" + hashlib.sha256(json.dumps(unsigned_entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if entry_checksum != expected_checksum or benchmark.get("reference_set_checksum") != entry_checksum:
+        report.error("benchmark_registry_checksum", f"{path}.reference_set_checksum", "Benchmark must bind the exact checksum of the approved external reference set.")
+        valid = False
+    set_key = f"{reference_id}@{reference_version}"
+    pinned_set_ids = policy_pin.get("reference_set_ids") if isinstance(policy_pin, Mapping) else None
+    pinned_set_checksums = policy_pin.get("reference_set_checksums") if isinstance(policy_pin, Mapping) else None
+    if not isinstance(pinned_set_ids, (list, tuple)) or set_key not in pinned_set_ids or not isinstance(pinned_set_checksums, Mapping) or pinned_set_checksums.get(set_key) != entry_checksum:
+        report.error("benchmark_registry_policy_reference_set", f"{path}.reference_set_id", "Trusted policy must pin the exact approved reference set ID/version and checksum.")
+        valid = False
+    corpus = entry.get("reference_corpus")
+    candidate_list = benchmark.get("candidate_ids")
+    if not isinstance(corpus, (list, tuple)) or not corpus or any(
+        not isinstance(item, Mapping) or not _nonempty_string(item.get("corpus_id")) or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(item.get("checksum"))) or not _nonempty_string(item.get("path"))
+        for item in corpus
+    ):
+        report.error("benchmark_registry_corpus", f"{path}.reference_set_id", "Approved benchmark entries must bind non-empty reference corpus IDs, checksums, and local paths.")
+        valid = False
+    trusted_root_value = data.get("trusted_root")
+    pinned_root = policy_pin.get("trusted_root") if isinstance(policy_pin, Mapping) else None
+    if not _nonempty_string(trusted_root_value) or pinned_root != trusted_root_value:
+        report.error("benchmark_registry_root", f"{path}.trusted_root", "Benchmark corpus files require a trusted registry root pinned by external policy.")
+        valid = False
+    corpus_root = None
+    if _nonempty_string(trusted_root_value):
+        try:
+            registry_parent = Path(registry_context.source_path).resolve(strict=True).parent
+            corpus_root = Path(trusted_root_value).expanduser().resolve(strict=True)
+            corpus_root.relative_to(registry_parent)
+        except (OSError, ValueError):
+            report.error("benchmark_registry_root", f"{path}.trusted_root", "Trusted benchmark root must be contained by the registry file's trusted parent and resolve without symlink traversal.")
+            corpus_root = None
+            valid = False
+    total_corpus_bytes = 0
+    if corpus_root is not None and isinstance(corpus, (list, tuple)):
+        if len(corpus) > MAX_RENDER_FILES:
+            report.error("benchmark_registry_corpus", f"{path}.reference_corpus", "Benchmark reference corpus count exceeds the bounded limit.")
+            valid = False
+        for corpus_index, item in enumerate(corpus):
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                corpus_path = Path(item.get("path")).expanduser()
+                corpus_digest, corpus_size = _safe_download_snapshot(corpus_path, corpus_root)
+            except (TypeError, ValueError):
+                corpus_digest, corpus_size = None, None
+            if corpus_digest is None or corpus_size is None:
+                report.error("benchmark_registry_corpus_file", f"{path}.reference_corpus[{corpus_index}].path", "Benchmark corpus path must be a bounded, contained, stable local file.")
+                valid = False
+                continue
+            total_corpus_bytes += corpus_size
+            if total_corpus_bytes > MAX_RENDER_TOTAL_BYTES or corpus_size > MAX_RENDER_FILE_BYTES:
+                report.error("benchmark_registry_corpus_size", f"{path}.reference_corpus", "Benchmark corpus files exceed bounded size limits.")
+                valid = False
+            if item.get("checksum") != "sha256:" + corpus_digest:
+                report.error("benchmark_registry_corpus_checksum", f"{path}.reference_corpus[{corpus_index}].checksum", "Benchmark corpus checksum must match the actual local file.")
+                valid = False
+    if not isinstance(candidate_list, (list, tuple)) or not candidate_list or any(not _nonempty_string(item) for item in candidate_list):
+        report.error("benchmark_registry_candidates", f"{path}.candidate_ids", "Benchmark evidence must bind explicit candidate IDs to the approved registry entry.")
+        valid = False
+    elif set(candidate_list) != set(entry.get("candidate_ids", ())):
+        report.error("benchmark_registry_candidates", f"{path}.candidate_ids", "Benchmark candidate IDs must exactly match the externally approved candidate window.")
+        valid = False
+    if tuple(sorted(str(item) for item in candidate_ids if _nonempty_string(item))) != tuple(sorted(str(item) for item in candidate_list if _nonempty_string(item))):
+        report.error("benchmark_registry_candidates", f"{path}.candidate_ids", "Pairwise verdict candidate IDs must exactly match the externally approved candidate IDs.")
+        valid = False
+    if render_digest is None or benchmark.get("render_digest") != render_digest:
+        report.error("benchmark_registry_render", f"{path}.render_digest", "Benchmark must bind the verified candidate render_digest.")
+        valid = False
+    benchmark_corpus = benchmark.get("reference_corpus")
+    if _json_plain(benchmark_corpus) != _json_plain(corpus):
+        report.error("benchmark_registry_corpus", f"{path}.reference_corpus", "Benchmark must bind the exact externally approved reference corpus IDs/checksums.")
+        valid = False
+    pinned_corpus = policy_pin.get("reference_corpus_checksums") if isinstance(policy_pin, Mapping) else None
+    if not isinstance(pinned_corpus, Mapping) or any(pinned_corpus.get(item.get("corpus_id")) != item.get("checksum") for item in corpus if isinstance(item, Mapping)):
+        report.error("benchmark_registry_policy_corpus", f"{path}.reference_corpus", "Trusted policy must pin every reference corpus checksum.")
+        valid = False
+    allowed_reviewers = entry.get("allowed_reviewer_ids")
+    allowed_roles = entry.get("allowed_reviewer_roles")
+    trusted_mapping = policy_context.data.get("role_mapping") if isinstance(policy_context, TrustedPolicyContext) and isinstance(policy_context.data, Mapping) else {}
+    reviewer_allowed = (
+        isinstance(allowed_reviewers, (list, tuple)) and reviewer_id in allowed_reviewers
+    ) or (
+        isinstance(allowed_roles, (list, tuple))
+        and isinstance(policy_context, TrustedPolicyContext)
+        and any(
+            reviewer_id in members
+            for role, members in (trusted_mapping if isinstance(trusted_mapping, Mapping) else {}).items()
+            if role in allowed_roles and isinstance(members, list)
+        )
+    )
+    if not reviewer_allowed:
+        report.error("benchmark_registry_reviewer", f"{path}.allowed_reviewer_ids", "Independent reviewer must be permitted by the external benchmark registry.")
+        valid = False
+    return valid
 
 
 def _validate_anti_slop_audit(
@@ -3427,6 +5450,9 @@ def _validate_anti_slop_audit(
     template_entries: list[dict[str, Any]],
     report: Report,
     provenance_authority: dict[str, Any] | None = None,
+    policy_context: Any = None,
+    actor_id: str | None = None,
+    benchmark_registry: Any = None,
 ) -> None:
     routes = _validate_route_set(spec, expected_scope, state, report)
     selected_route_id = _validate_human_selected_route(spec, routes, expected_scope, state, report)
@@ -3434,14 +5460,25 @@ def _validate_anti_slop_audit(
     _validate_production_controls(spec, expected_scope, template_entries, state, report)
     _validate_page_contract(spec, spec.get("source_packet"), state, report)
     _validate_message_unit_contract(spec, state, report, provenance_authority)
+    _validate_action_receipts(spec, state, expected_scope, policy_context, report)
 
     required = _anti_slop_route_required(spec, state)
+    final_required = _anti_slop_final_required(spec, state)
     audit = spec.get("anti_slop_audit")
     if audit is None and not required:
         return
     if not isinstance(audit, dict):
         report.error("anti_slop_audit_required", "$.anti_slop_audit", "Canva mutation/final states require an explainable anti_slop_audit.")
         return
+    contract_version = audit.get("anti_slop_contract_version")
+    if contract_version == 1:
+        if final_required:
+            report.error("anti_slop_contract_version", "$.anti_slop_audit.anti_slop_contract_version", "Anti-slop contract v1 is migration-only and cannot authorize final or Canva mutation states.")
+        else:
+            report.warning("anti_slop_contract_migration", "$.anti_slop_audit.anti_slop_contract_version", "Anti-slop contract v1 is readable for drafts but must migrate to v2 before production.")
+    elif contract_version is not None and contract_version != ANTI_SLOP_CONTRACT_VERSION:
+        severity = report.error if final_required else report.warning
+        severity("anti_slop_contract_version", "$.anti_slop_audit.anti_slop_contract_version", "Production anti-slop evidence requires anti_slop_contract_version=2; drafts may carry a migration warning.")
     audit_status = audit.get("status")
     if not isinstance(audit_status, str) or audit_status not in {"pending", "pass", "fail"}:
         report.error("anti_slop_audit_status", "$.anti_slop_audit.status", "Anti-slop audit status must be pending, pass, or fail.")
@@ -3504,10 +5541,33 @@ def _validate_anti_slop_audit(
     if required and isinstance(rubric_total, (int, float)) and rubric_total < 80:
         report.error("rubric_threshold", "$.anti_slop_audit.rubric.total", "Production/final content requires at least 80/100 and no hard blocker.")
 
+    # Resolve the artifact once and use its digest as the binding key for all
+    # render-derived evidence.  No vision is performed here; bytes, headers,
+    # dimensions, and evidence shape are deterministic checks.
+    render_digest, render_pages = _validate_render_binding(
+        spec,
+        expected_scope,
+        state,
+        report,
+        policy_context=policy_context,
+        actor_id=actor_id,
+    )
+    _validate_visual_fingerprints(
+        spec,
+        audit,
+        state,
+        render_digest,
+        report,
+        expected_scope=expected_scope,
+        policy_context=policy_context,
+        render_pages=render_pages,
+    )
+
     evidence = audit.get("evidence")
     if not isinstance(evidence, dict):
         report.error("anti_slop_evidence", "$.anti_slop_audit.evidence", "Anti-slop audit requires OCR, layout, semantic, WCAG, rights, and similarity evidence.")
         evidence = {}
+    evidence_statuses: dict[str, str | None] = {}
     for key in ANTI_SLOP_EVIDENCE_KEYS:
         path = f"$.anti_slop_audit.evidence.{key}"
         evidence_value = evidence.get(key)
@@ -3523,24 +5583,89 @@ def _validate_anti_slop_audit(
                 }[key]
             )
         status = _validate_evidence_status(evidence_value, path, report)
+        evidence_statuses[key] = status
         if required and (not isinstance(evidence_value, dict) or status != "pass"):
             report.error("anti_slop_evidence_block", path, "Canva mutation/final states require structured passing evidence for every quality gate.")
         if required and isinstance(evidence_value, dict):
-            if _parse_datetime(evidence_value.get("checked_at", evidence_value.get("timestamp"))) is None:
+            checked_at = _parse_datetime(evidence_value.get("checked_at", evidence_value.get("timestamp")))
+            if checked_at is None:
                 report.error("anti_slop_evidence_timestamp", path, "Required evidence needs a timezone-aware checked_at timestamp.")
+            elif _timestamp_is_future(checked_at):
+                report.error("anti_slop_evidence_timestamp_future", path, "Required evidence timestamp cannot be in the future beyond the allowed clock skew.")
+            else:
+                design_for_time = spec.get("design") if isinstance(spec.get("design"), Mapping) else {}
+                render_for_time = design_for_time.get("render_evidence") if isinstance(design_for_time, Mapping) else {}
+                render_time = _parse_datetime(render_for_time.get("captured_at", render_for_time.get("verified_at"))) if isinstance(render_for_time, Mapping) else None
+                if render_time is not None and checked_at < render_time:
+                    report.error("anti_slop_evidence_timestamp_order", path, "Evidence timestamp must not precede the verified render receipt.")
+                selection_for_time = spec.get("human_selected_route") if isinstance(spec.get("human_selected_route"), Mapping) else {}
+                selection_time = _parse_datetime(selection_for_time.get("selected_at", selection_for_time.get("timestamp"))) if isinstance(selection_for_time, Mapping) else None
+                if selection_time is not None and checked_at < selection_time:
+                    report.error("anti_slop_evidence_timestamp_order", path, "Evidence timestamp must not precede the route-selection receipt.")
+                trusted_policy_data_for_time = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+                action_records_for_time = trusted_policy_data_for_time.get("action_records") if isinstance(trusted_policy_data_for_time, Mapping) else None
+                if isinstance(action_records_for_time, Mapping):
+                    for action_name, action_record in action_records_for_time.items():
+                        action_time = _parse_datetime(action_record.get("recorded_at")) if isinstance(action_record, Mapping) else None
+                        if action_time is not None and checked_at < action_time:
+                            report.error("anti_slop_evidence_timestamp_order", path, f"Evidence timestamp must not precede the {action_name} action receipt.")
             if not isinstance(evidence_value.get("page_refs", evidence_value.get("render_refs", [])), list) or not evidence_value.get("page_refs", evidence_value.get("render_refs", [])):
                 report.error("anti_slop_evidence_refs", path, "Required evidence needs non-empty page or render references.")
+        if final_required and isinstance(evidence_value, dict) and key in ANTI_SLOP_RENDER_EVIDENCE_KEYS and render_digest:
+            if key in {"ocr", "layout", "semantic"}:
+                _validate_evidence_authority(evidence_value, key, path, render_digest, policy_context, report)
+                _validate_external_result_receipt(
+                    evidence_value,
+                    key,
+                    path,
+                    spec,
+                    render_digest,
+                    expected_scope,
+                    policy_context,
+                    report,
+                )
+            if key == "layout" and status == "pass":
+                _validate_layout_evidence(evidence_value, path, spec, render_digest, report, final_required)
+            elif key == "semantic" and status == "pass":
+                _validate_semantic_evidence(evidence_value, path, spec, render_digest, report)
+            elif key == "recent_similarity" and status == "pass":
+                _validate_similarity_evidence(evidence_value, path, spec, render_digest, report, policy_context)
+                _validate_external_result_receipt(
+                    evidence_value,
+                    key,
+                    path,
+                    spec,
+                    render_digest,
+                    expected_scope,
+                    policy_context,
+                    report,
+                )
+            elif key == "ocr" and evidence_value.get("render_digest") != render_digest:
+                report.error("evidence_render_binding", f"{path}.render_digest", "OCR evidence must bind the exact render_digest used by the package.")
+            if key in ANTI_SLOP_RENDER_EVIDENCE_KEYS:
+                render_refs = _render_page_refs(spec)
+                evidence_refs = evidence_value.get("page_refs")
+                if isinstance(render_refs, list) and evidence_refs != render_refs:
+                    report.error("evidence_page_refs", f"{path}.page_refs", "Render-derived evidence page_refs must exactly match the verified render page map.")
+                elif isinstance(evidence_refs, list):
+                    if any(not _nonempty_string(ref) for ref in evidence_refs):
+                        report.error("evidence_page_refs_type", f"{path}.page_refs", "Render-derived evidence page_refs must be non-empty strings.")
+                    elif len(set(evidence_refs)) != len(evidence_refs):
+                        report.error("evidence_page_refs_unique", f"{path}.page_refs", "Render-derived evidence page_refs must be unique.")
         if key == "ocr" and isinstance(evidence_value, dict) and status == "pass" and evidence_value.get("exact_match") is not True:
             report.error("ocr_exact_match", path, "OCR evidence must explicitly record exact_match true.")
         if key == "layout" and isinstance(evidence_value, dict) and status == "pass":
-            if evidence_value.get("overflow") not in (False, "none") or evidence_value.get("overlap") not in (False, "none"):
+            if ("overflow" in evidence_value and evidence_value.get("overflow") not in (False, "none")) or ("overlap" in evidence_value and evidence_value.get("overlap") not in (False, "none")):
                 report.error("layout_evidence_incomplete", path, "Passing layout evidence must explicitly record overflow=false and overlap=false.")
             if evidence_value.get("overflow") is True or evidence_value.get("overlap") is True:
                 report.error("layout_blocker", path, "Layout evidence cannot pass with overflow or collision.")
         if key == "semantic" and isinstance(evidence_value, dict) and status == "pass":
             checks = evidence_value.get("contract_tests", evidence_value.get("checks"))
             if not isinstance(checks, list) or not checks:
-                report.error("semantic_evidence_incomplete", path, "Passing semantic evidence must list object/count/color/relation/CTA contract checks.")
+                if final_required and isinstance(evidence_value.get("pages"), list) and evidence_value.get("pages"):
+                    checks = evidence_value.get("pages")
+                else:
+                    report.error("semantic_evidence_incomplete", path, "Passing semantic evidence must list object/count/relation/copy-image/CTA contract checks.")
         if key == "rights" and isinstance(evidence_value, dict) and status == "pass":
             if not isinstance(evidence_value.get("assets"), list) and not isinstance(evidence_value.get("provenance"), list):
                 report.error("rights_evidence_incomplete", path, "Passing rights evidence must list asset provenance or an explicit empty assets list.")
@@ -3561,6 +5686,138 @@ def _validate_anti_slop_audit(
             report.error("independent_critique_reviewer", "$.anti_slop_audit.independent_critique.reviewer_id", "Independent critique requires a reviewer ID.")
         if independent.get("independent_from_generation") is not True:
             report.error("independent_critique_independence", "$.anti_slop_audit.independent_critique.independent_from_generation", "Critique must be independently performed.")
+        if final_required:
+            critique_path = "$.anti_slop_audit.independent_critique"
+            critique_timestamp = _parse_datetime(independent.get("reviewed_at", independent.get("timestamp")))
+            if critique_timestamp is None:
+                report.error("independent_critique_timestamp", critique_path, "Final critique requires a timezone-aware review timestamp.")
+            elif _timestamp_is_future(critique_timestamp):
+                report.error("independent_critique_timestamp_future", critique_path, "Final critique timestamp cannot be in the future beyond the allowed clock skew.")
+            else:
+                design_for_time = spec.get("design") if isinstance(spec.get("design"), Mapping) else {}
+                render_for_time = design_for_time.get("render_evidence") if isinstance(design_for_time, Mapping) else {}
+                render_time = _parse_datetime(render_for_time.get("captured_at", render_for_time.get("verified_at"))) if isinstance(render_for_time, Mapping) else None
+                if render_time is not None and critique_timestamp < render_time:
+                    report.error("independent_critique_timestamp_order", critique_path, "Final critique timestamp must not precede the verified render receipt.")
+                selection_for_time = spec.get("human_selected_route") if isinstance(spec.get("human_selected_route"), Mapping) else {}
+                selection_time = _parse_datetime(selection_for_time.get("selected_at", selection_for_time.get("timestamp"))) if isinstance(selection_for_time, Mapping) else None
+                if selection_time is not None and critique_timestamp < selection_time:
+                    report.error("independent_critique_timestamp_order", critique_path, "Final critique timestamp must not precede the route-selection receipt.")
+                trusted_policy_data_for_time = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+                action_records_for_time = trusted_policy_data_for_time.get("action_records") if isinstance(trusted_policy_data_for_time, Mapping) else None
+                if isinstance(action_records_for_time, Mapping):
+                    for action_name, action_record in action_records_for_time.items():
+                        action_time = _parse_datetime(action_record.get("recorded_at")) if isinstance(action_record, Mapping) else None
+                        if action_time is not None and critique_timestamp < action_time:
+                            report.error("independent_critique_timestamp_order", critique_path, f"Final critique timestamp must not precede the {action_name} action receipt.")
+            if not _nonempty_string(independent.get("method")):
+                report.error("independent_critique_method", f"{critique_path}.method", "Final critique requires a named review method.")
+            if independent.get("render_digest") != render_digest:
+                report.error("evidence_render_binding", f"{critique_path}.render_digest", "Independent critique must bind the exact render_digest used by the package.")
+            critique_pages = independent.get("page_refs")
+            if not isinstance(critique_pages, list) or not critique_pages:
+                report.error("independent_critique_refs", f"{critique_path}.page_refs", "Final critique requires non-empty page_refs.")
+            else:
+                render_refs = _render_page_refs(spec)
+                if isinstance(render_refs, list) and critique_pages != render_refs:
+                    report.error("independent_critique_refs", f"{critique_path}.page_refs", "Final critique page_refs must exactly match the verified render page map.")
+                if any(not _nonempty_string(ref) for ref in critique_pages):
+                    report.error("independent_critique_refs_type", f"{critique_path}.page_refs", "Final critique page_refs must be non-empty strings.")
+                elif len(set(critique_pages)) != len(critique_pages):
+                    report.error("independent_critique_refs_unique", f"{critique_path}.page_refs", "Final critique page_refs must be unique.")
+            observations = independent.get("observations", independent.get("findings"))
+            if not isinstance(observations, list) or not observations or any(
+                not (_nonempty_string(item) if isinstance(item, str) else isinstance(item, dict) and _nonempty_string(item.get("observation", item.get("message"))))
+                for item in observations
+            ):
+                report.error("independent_critique_observations", f"{critique_path}.observations", "Final critique requires non-empty observations tied to visible review work.")
+            if not _nonempty_string(independent.get("verdict")):
+                report.error("independent_critique_verdict", f"{critique_path}.verdict", "Final critique requires a non-empty verdict.")
+            benchmark = independent.get("benchmark")
+            if not isinstance(benchmark, dict) or not _nonempty_string(benchmark.get("reference_set_id")) or not _nonempty_string(benchmark.get("version")):
+                report.error("independent_benchmark", f"{critique_path}.benchmark", "Final critique requires a benchmark reference set ID and version.")
+            else:
+                benchmark_status = benchmark.get("status", "pass")
+                pairwise = benchmark.get("pairwise_verdict")
+                if benchmark_status not in {"pass", "pending", "cannot_verify"}:
+                    report.error("independent_benchmark_status", f"{critique_path}.benchmark.status", "Benchmark status must be pass, pending, or cannot_verify.")
+                if benchmark_status == "pass":
+                    _validate_benchmark_registry(
+                        benchmark,
+                        expected_scope,
+                        independent.get("reviewer_id"),
+                        policy_context,
+                        benchmark_registry,
+                        f"{critique_path}.benchmark",
+                        report,
+                        render_digest=render_digest,
+                        candidate_ids=[item.get("candidate_id") for item in pairwise] if isinstance(pairwise, list) else (),
+                    )
+                    _validate_external_result_receipt(
+                        benchmark,
+                        "benchmark",
+                        f"{critique_path}.benchmark",
+                        spec,
+                        render_digest,
+                        expected_scope,
+                        policy_context,
+                        report,
+                    )
+                elif benchmark_status in {"pending", "cannot_verify"} and benchmark_registry is not None:
+                    report.warning("independent_benchmark_pending", f"{critique_path}.benchmark.status", "Benchmark remains pending/cannot_verify and does not authorize a production pass.")
+                valid_pairwise = (
+                    isinstance(pairwise, list) and bool(pairwise) and all(
+                        isinstance(item, dict) and _nonempty_string(item.get("candidate_id")) and item.get("verdict") in BENCHMARK_VERDICTS
+                        for item in pairwise
+                    )
+                )
+                if not valid_pairwise:
+                    report.error("independent_benchmark_pairwise", f"{critique_path}.benchmark.pairwise_verdict", "Benchmark evidence requires a structured pairwise verdict.")
+                if benchmark_status == "pass":
+                    if independent.get("verdict") not in {"pass", "distinct", "different"}:
+                        report.error("independent_benchmark_coherence", f"{critique_path}.verdict", "A passing benchmark requires a passing/distinct critique verdict.")
+                    if isinstance(pairwise, list) and any(item.get("verdict") in {"not_distinct", "same", "identical", "reject", "fail"} for item in pairwise if isinstance(item, dict)):
+                        report.error("independent_benchmark_coherence", f"{critique_path}.benchmark.pairwise_verdict", "A benchmark pass cannot coexist with an identical/reject/fail pairwise verdict.")
+            trusted_data = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+            role = independent.get("reviewer_role")
+            reviewer_id = independent.get("reviewer_id")
+            selector = spec.get("human_selected_route") if isinstance(spec.get("human_selected_route"), dict) else {}
+            design = spec.get("design") if isinstance(spec.get("design"), dict) else {}
+            selector_id = selector.get("selected_by")
+            generator_id = design.get("generated_by", design.get("created_by"))
+            if final_required:
+                if not _nonempty_string(selector_id):
+                    report.error("independent_selector_identity", f"{critique_path}.selector_id", "Final critique requires an explicit route-selector identity.")
+                elif not _trusted_identity_mapped(selector_id, policy_context):
+                    report.error("independent_selector_trust", f"{critique_path}.selector_id", "Route selector must be mapped by the separately loaded trusted policy.")
+                if not _nonempty_string(generator_id):
+                    report.error("independent_generator_identity", f"{critique_path}.generator_id", "Final critique requires an explicit generator identity.")
+                elif not _trusted_identity_mapped(generator_id, policy_context):
+                    report.error("independent_generator_trust", f"{critique_path}.generator_id", "Generator must be mapped by the separately loaded trusted policy.")
+                elif selector_id == generator_id and not (
+                    isinstance(policy_context, TrustedPolicyContext)
+                    and policy_context.data.get("allow_single_person_review") is True
+                ):
+                    report.error("independent_generator_not_distinct", f"{critique_path}.generator_id", "Generator and route selector must be distinct unless trusted policy explicitly authorizes a single-person review.")
+            mapped = (
+                isinstance(trusted_data, Mapping)
+                and isinstance(trusted_data.get("role_mapping"), Mapping)
+                and _nonempty_string(role)
+                and role in {"reviewer", "lead"}
+                and _nonempty_string(reviewer_id)
+                and isinstance(trusted_data.get("role_mapping", {}).get(role), list)
+                and reviewer_id in trusted_data.get("role_mapping", {}).get(role, [])
+            )
+            if not mapped:
+                report.error("independent_critique_reviewer_trust", f"{critique_path}.reviewer_id", "Final critique reviewer must be a mapped reviewer/lead from the separately loaded trusted policy.")
+            selector_actor = selector_id
+            generator_actor = generator_id
+            allow_single_person_review = isinstance(trusted_data, Mapping) and trusted_data.get("allow_single_person_review") is True
+            if _nonempty_string(reviewer_id) and not allow_single_person_review and any(
+                _nonempty_string(candidate) and reviewer_id == candidate
+                for candidate in (actor_id, selector_actor, generator_actor)
+            ):
+                report.error("independent_critique_not_distinct", f"{critique_path}.reviewer_id", "Final critique reviewer must be distinct from the generator and route selector.")
 
     blockers = audit.get("hard_blockers")
     if not isinstance(blockers, dict):
@@ -3578,12 +5835,110 @@ def _validate_anti_slop_audit(
             elif code not in ANTI_SLOP_HARD_BLOCKER_KEYS:
                 report.error("hard_blocker_key", f"$.anti_slop_audit.hard_blockers.{code}", "Unknown hard-blocker key.")
 
+    # A passing 80+ score is not coherent with known failed/pending gates or a
+    # blocker finding. Keep the supplied score for auditability, but fail the
+    # record rather than allowing stale quality to authorize production.
+    known_failure = any(status in {"fail", "pending"} for status in evidence_statuses.values())
+    known_failure = known_failure or any(
+        isinstance(finding, dict)
+        and not (
+            finding.get("resolved") is True
+            or finding.get("status") in {"resolved", "closed", "accepted"}
+            or _nonempty_string(finding.get("resolution"))
+        )
+        and (
+            str(finding.get("severity", "")).casefold() in {"error", "blocker", "high", "fail"}
+            or finding.get("reason_code", finding.get("code")) in {
+                "ocr_mismatch", "layout_collision", "semantic_mismatch", "rights_unresolved", "unsupported_claim", "missing_source", "approval_package_missing"
+            }
+        )
+        for finding in findings
+    ) if isinstance(findings, list) else known_failure
+    if isinstance(blockers, dict):
+        known_failure = known_failure or any(
+            (item.get("status") if isinstance(item, dict) else item if isinstance(item, str) else None) in {"fail", "pending"}
+            for item in blockers.values()
+        )
+    finding_records = findings if isinstance(findings, list) else []
+    finding_codes = {
+        finding.get("reason_code", finding.get("code"))
+        for finding in finding_records
+        if isinstance(finding, dict) and isinstance(finding.get("reason_code", finding.get("code")), str)
+    }
+    reason_to_blocker = {
+        "ocr_mismatch": "ocr_exact_match",
+        "layout_collision": "layout_integrity",
+        "semantic_mismatch": "semantic_contract",
+        "wcag_contrast": "wcag_accessibility",
+        "rights_unresolved": "rights_provenance",
+        "template_scope_mismatch": "template_controls",
+        "approval_package_missing": "approval_package",
+    }
+    if isinstance(reason_codes, list):
+        for reason_code in reason_codes:
+            if not isinstance(reason_code, str):
+                continue
+            blocker_key = reason_to_blocker.get(reason_code)
+            blocker_status = blockers.get(blocker_key) if isinstance(blockers, dict) and blocker_key else None
+            blocker_status = blocker_status.get("status") if isinstance(blocker_status, dict) else blocker_status if isinstance(blocker_status, str) else None
+            if reason_code not in finding_codes and blocker_status not in {"fail", "pending"}:
+                report.error("anti_slop_reason_unbound", "$.anti_slop_audit.reason_codes", f"Reason code {reason_code!r} must bind to a finding or unresolved hard blocker.")
+    active_reason = False
+    if isinstance(reason_codes, list):
+        for reason_code in reason_codes:
+            if not isinstance(reason_code, str):
+                continue
+            matching = [finding for finding in finding_records if isinstance(finding, dict) and finding.get("reason_code", finding.get("code")) == reason_code]
+            if not matching or any(
+                not (
+                    finding.get("resolved") is True
+                    or finding.get("status") in {"resolved", "closed", "accepted"}
+                    or _nonempty_string(finding.get("resolution"))
+                )
+                for finding in matching
+            ):
+                active_reason = True
+                break
+    known_failure = known_failure or active_reason
+    quality_issue_prefixes = (
+        "visual_fingerprint", "asset_", "approved_exception", "repeated_full_composition",
+        "render_", "layout_", "semantic_", "similarity_", "independent_critique", "independent_benchmark", "benchmark_registry",
+        "evidence_render_binding", "evidence_page_refs", "generic_cta_target_missing", "decorative_element_proof_missing",
+        "repeated_identical_pixels", "near_identical_pixels", "action_receipt", "trusted_policy_action",
+        "evidence_result", "evidence_authority",
+    )
+    known_failure = known_failure or any(
+        issue.code in {"anti_slop_reason_codes", "anti_slop_reason_unbound"} or issue.code.startswith(quality_issue_prefixes)
+        for issue in report.errors
+    )
+    high_slop = {
+        dimension for dimension in ANTI_SLOP_SLOP_DIMENSIONS
+        if isinstance(slop_index.get(dimension), int) and not isinstance(slop_index.get(dimension), bool) and slop_index.get(dimension) >= 4
+    }
+    slop_total = sum(score for score in slop_index.values() if isinstance(score, int) and not isinstance(score, bool))
+    resolved_dimensions = {
+        str(finding.get("dimension"))
+        for finding in finding_records
+        if isinstance(finding, dict) and (
+            finding.get("resolved") is True
+            or finding.get("status") in {"resolved", "closed", "accepted"}
+            or _nonempty_string(finding.get("resolution"))
+        )
+    }
+    unresolved_high_slop = high_slop - resolved_dimensions
+    if isinstance(rubric_total, (int, float)) and rubric_total >= 80 and audit_status == "pass" and (unresolved_high_slop or slop_total >= 12):
+        report.error("score_incoherent", "$.anti_slop_audit.slop_index", "A high slop-risk index cannot coexist with a passing 80+ rubric unless each high-risk dimension is explicitly resolved and the aggregate risk is recomputed.")
+    if isinstance(rubric_total, (int, float)) and rubric_total >= 80 and audit_status == "pass" and known_failure:
+        report.error("score_incoherent", "$.anti_slop_audit.rubric.total", "A passing 80+ score cannot coexist with failed or pending evidence/blockers; recompute the score or resolve the finding.")
+
     package = audit.get("approval_package")
     if required:
         if not isinstance(package, dict):
             report.error("approval_package_missing", "$.anti_slop_audit.approval_package", "Final content requires a scoped approval package and checksum evidence.")
         else:
             _validate_anti_scope(package.get("scope"), "$.anti_slop_audit.approval_package.scope", expected_scope, report, required=True)
+            if package.get("checksum_algorithm") != ANTI_SLOP_CHECKSUM_ALGORITHM:
+                report.error("anti_slop_checksum_algorithm", "$.anti_slop_audit.approval_package.checksum_algorithm", "Final approval packages must declare checksum_algorithm=anti-slop-v2; legacy checksum algorithms cannot authorize final content.")
             if package.get("content_id") != spec.get("content_id"):
                 report.error("approval_package_content", "$.anti_slop_audit.approval_package.content_id", "Approval package content_id must match the content record.")
             export_checksum = spec.get("design", {}).get("export_checksum") if isinstance(spec.get("design"), dict) else None
@@ -3591,6 +5946,8 @@ def _validate_anti_slop_audit(
                 report.error("approval_package_export", "$.anti_slop_audit.approval_package.export_checksum", "Approval package must bind the exact export checksum.")
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(package.get("render_digest"))):
                 report.error("approval_package_render", "$.anti_slop_audit.approval_package.render_digest", "Approval package requires a sha256 render digest.")
+            elif render_digest is not None and package.get("render_digest") != render_digest:
+                report.error("approval_package_render", "$.anti_slop_audit.approval_package.render_digest", "Approval package render_digest must match the verified render artifact.")
             expected_package_checksum = _anti_slop_package_checksum(spec, audit)
             if package.get("checksum") != expected_package_checksum:
                 report.error("anti_slop_package_checksum", "$.anti_slop_audit.approval_package.checksum", "Approval package checksum does not match route, audit, render, and export evidence.")
@@ -3963,7 +6320,8 @@ def _validate_measurement(
                 "$.measurement.benchmark_scope",
                 "Benchmark tenant/client/product/brand must match the content isolation scope.",
             )
-        if benchmark_scope.get("account") != spec.get("publishing", {}).get("target_account"):
+        publishing_for_measurement = spec.get("publishing") if isinstance(spec.get("publishing"), dict) else {}
+        if benchmark_scope.get("account") != publishing_for_measurement.get("target_account"):
             report.error("benchmark_account_mismatch", "$.measurement.benchmark_scope.account", "Benchmark account must match the publishing target.")
         if benchmark_scope.get("content_pillar") != spec.get("content_pillar"):
             report.error("benchmark_pillar_mismatch", "$.measurement.benchmark_scope.content_pillar", "Benchmark pillar must match content_pillar.")
@@ -4049,6 +6407,9 @@ def validate_content_spec(
     brand_policy_context: Any = None,
     brand_actor_id: str | None = None,
     master_brand_bundle: str | Path | None = None,
+    benchmark_registry: Any = None,
+    policy_digest: str | None = None,
+    require_policy_digest: bool | None = None,
 ) -> Report:
     report = Report()
     today = today or datetime.now(timezone.utc).date()
@@ -4093,7 +6454,16 @@ def validate_content_spec(
 
     canonical_scope = _validate_scope(spec, report)
     policy = _validate_policy(spec, canonical_scope, report)
-    _validate_trusted_policy(spec, policy, canonical_scope, state, policy_context, actor_id, report)
+    # Final/privileged programmatic calls must receive the digest pin just as
+    # the CLI does. A caller cannot weaken that requirement with an explicit
+    # ``require_policy_digest=False``; the flag can only make drafts stricter.
+    privileged_policy = _state_at_least(state, "HUMAN_APPROVED") or policy.get("mode") == "unattended"
+    require_policy_digest = privileged_policy or require_policy_digest is True
+    _validate_trusted_policy(
+        spec, policy, canonical_scope, state, policy_context, actor_id, report,
+        expected_policy_digest=policy_digest,
+        require_policy_digest=require_policy_digest,
+    )
     bundle = _validate_brand_bundle(
         brand_bundle,
         canonical_scope,
@@ -4160,6 +6530,7 @@ def validate_content_spec(
 
     slides = spec.get("slides")
     ctas: list[str] = []
+    cta_entries: list[tuple[str, str, Any]] = []
     slide_text_chunks: list[str] = []
     if not isinstance(slides, list) or not slides:
         report.error("slides", "$.slides", "slides must be a non-empty list.")
@@ -4197,6 +6568,7 @@ def validate_content_spec(
             cta_value = slide.get("cta")
             if _nonempty_string(cta_value):
                 ctas.append(cta_value)
+                cta_entries.append((f"{path}.cta", cta_value, slide.get("cta_target", spec.get("cta_target"))))
             slide_text_chunks.extend(str(slide.get(key, "")) for key in ("headline", "body", "cta"))
 
     caption = spec.get("caption")
@@ -4211,6 +6583,7 @@ def validate_content_spec(
             report.error("caption_hook", "$.caption.hook", "Copy review requires a hook.")
         if _nonempty_string(caption.get("cta")):
             ctas.append(caption["cta"])
+            cta_entries.append(("$.caption.cta", caption["cta"], caption.get("cta_target", spec.get("cta_target"))))
         hashtags = caption.get("hashtags")
         if not isinstance(hashtags, list):
             report.error("hashtags", "$.caption.hashtags", "hashtags must be a list.")
@@ -4240,6 +6613,7 @@ def validate_content_spec(
         report.error("multiple_ctas", "$.caption.cta", f"Found competing CTA phrases: {sorted(distinct_ctas)}.")
     if _state_at_least(state, "COPY_REVIEW") and not distinct_ctas:
         report.warning("missing_cta", "$.caption.cta", "No CTA is present; document an intentional no-CTA decision if appropriate.")
+    _validate_cta_destination(spec, state, cta_entries, report)
 
     alt_text = spec.get("alt_text")
     if not isinstance(alt_text, str):
@@ -4456,18 +6830,37 @@ def validate_content_spec(
                 if _nonempty_string(local_path):
                     try:
                         local_file = Path(local_path).expanduser()
-                        if local_file.is_symlink() or not local_file.is_file():
-                            report.error("download_file_missing", "$.design.download.local_path", "Downloaded export local_path must point to a regular file.")
+                        trusted_policy_data = policy_context.data if isinstance(policy_context, TrustedPolicyContext) else None
+                        trusted_root_value = trusted_policy_data.get("download_root") if isinstance(trusted_policy_data, Mapping) else None
+                        if not _nonempty_string(trusted_root_value):
+                            report.error("download_trusted_root", "$.design.download.local_path", "Final downloads require a trusted_root supplied by verified policy/runtime; record-controlled roots cannot authorize containment.")
+                            trusted_root = None
                         else:
-                            local_file_size = local_file.stat().st_size
-                            if local_file_size <= 0:
-                                report.error("download_file_empty", "$.design.download.local_path", "Downloaded export local_path must be non-empty.")
-                            else:
-                                digest = hashlib.sha256()
-                                with local_file.open("rb") as handle:
-                                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                                        digest.update(chunk)
-                                local_file_sha256 = digest.hexdigest()
+                            trusted_root = Path(trusted_root_value).expanduser()
+                        if "trusted_root" in download and download.get("trusted_root") != trusted_root_value:
+                            report.error("download_trusted_root", "$.design.download.trusted_root", "Record-controlled trusted_root must not differ from the verified policy/runtime root.")
+                        download_root_identity = (
+                            _validate_filesystem_root_pin(
+                                policy_context,
+                                "download",
+                                trusted_root,
+                                report,
+                                "$.design.download.trusted_root",
+                            )
+                            if trusted_root is not None
+                            else None
+                        )
+                        local_file_sha256, local_file_size = (
+                            _safe_download_snapshot(local_file, trusted_root, download_root_identity)
+                            if download_root_identity is not None
+                            else (None, None)
+                        )
+                        if local_file_size is not None and local_file_size > MAX_DOWNLOAD_FILE_BYTES:
+                            report.error("download_file_too_large", "$.design.download.local_path", f"Downloaded exports must be at most {MAX_DOWNLOAD_FILE_BYTES} bytes.")
+                        elif local_file_sha256 is None or local_file_size is None:
+                            report.error("download_file_missing", "$.design.download.local_path", "Downloaded export local_path must point to a regular file.")
+                        elif local_file_size <= 0:
+                            report.error("download_file_empty", "$.design.download.local_path", "Downloaded export local_path must be non-empty.")
                     except (OSError, ValueError):
                         report.error("download_file_missing", "$.design.download.local_path", "Downloaded export local_path could not be read.")
                 receipt = download.get("receipt")
@@ -4697,7 +7090,17 @@ def validate_content_spec(
         policy=policy,
         actor_id=actor_id,
     )
-    _validate_anti_slop_audit(spec, canonical_scope, state, template_entries, report, bundle)
+    _validate_anti_slop_audit(
+        spec,
+        canonical_scope,
+        state,
+        template_entries,
+        report,
+        bundle,
+        policy_context=policy_context,
+        actor_id=actor_id,
+        benchmark_registry=benchmark_registry,
+    )
 
     return report
 
@@ -4720,10 +7123,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brand", type=Path, help="Optional brand profile JSON path")
     parser.add_argument("--policy", type=Path, help="Trusted local_authenticated_policy JSON path (required for privileged states)")
     parser.add_argument("--actor-id", help="Trusted current runtime identity (required for privileged states)")
+    parser.add_argument("--policy-digest", help="Independently supplied sha256:<64> trusted-policy pin (required for privileged CLI validation)")
     parser.add_argument("--brand-bundle", type=Path, help="Validated Brand Copy Studio four-file bundle directory for privileged claims/recipes/unattended generation")
     parser.add_argument("--brand-policy", type=Path, help="Trusted Brand Copy local_authenticated_policy JSON path (separate from content policy)")
     parser.add_argument("--brand-actor-id", help="Trusted current Brand Copy activation identity (separate from content actor)")
     parser.add_argument("--master-brand-bundle", type=Path, help="Independently loaded active master Brand Copy four-file bundle for privileged product overlays")
+    parser.add_argument("--benchmark-registry", type=Path, help="Independently loaded benchmark registry JSON for production critique comparisons")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as validation failures")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Emit a machine-readable report")
     parser.add_argument("--today", type=_parse_cli_date, help="Override today's date for deterministic checks")
@@ -4737,12 +7142,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         spec = _load_json(args.content_spec)
         brand = _load_json(args.brand) if args.brand else None
         policy_context = load_trusted_policy(args.policy) if args.policy else None
+        benchmark_registry = load_benchmark_registry(args.benchmark_registry) if args.benchmark_registry else None
         if args.brand_policy:
             brand_validator = _load_brand_bundle_validator()
             brand_policy_context = brand_validator.TrustedAccessPolicyContext.from_file(args.brand_policy) if brand_validator is not None else None
         else:
             brand_policy_context = None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         payload = {"valid": False, "summary": {"errors": 1, "warnings": 0}, "issues": [{"severity": "error", "code": "input", "path": "$", "message": str(exc)}]}
         print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json_output else f"ERROR input $: {exc}")
         return 1
@@ -4757,6 +7163,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         brand_policy_context=brand_policy_context,
         brand_actor_id=args.brand_actor_id,
         master_brand_bundle=args.master_brand_bundle,
+        benchmark_registry=benchmark_registry,
+        policy_digest=args.policy_digest,
+        require_policy_digest=True,
     )
     checksum = calculate_package_checksum(spec)
     if args.json_output:
